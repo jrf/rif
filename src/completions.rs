@@ -3,8 +3,9 @@ pub fn print_completions(shell: &str) {
         "bash" => print!("{}", BASH),
         "zsh" => print!("{}", ZSH),
         "fish" => print!("{}", FISH),
+        "nu" | "nushell" => print!("{}", NU),
         _ => {
-            eprintln!("error: unsupported shell '{}' (bash, zsh, fish)", shell);
+            eprintln!("error: unsupported shell '{}' (bash, zsh, fish, nu)", shell);
             std::process::exit(1);
         }
     }
@@ -29,7 +30,7 @@ const BASH: &str = r#"_rift_completions() {
       COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
       ;;
     completions)
-      COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
+      COMPREPLY=($(compgen -W "bash zsh fish nu" -- "$cur"))
       ;;
     list|ls)
       COMPREPLY=($(compgen -W "--short --verbose" -- "$cur"))
@@ -83,7 +84,7 @@ const ZSH: &str = r#"_rift() {
           _rift_sessions
           ;;
         completions)
-          _values 'shell' 'bash' 'zsh' 'fish'
+          _values 'shell' 'bash' 'zsh' 'fish' 'nu'
           ;;
         list|ls)
           _values 'options' '--short' '--verbose'
@@ -134,7 +135,7 @@ complete -c rift -s h -d 'Print help'
 
 complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr tail t kill k detach d history hi wait w rename rn logs lg" -a '(rift list --short 2>/dev/null)' -d 'Session name'
 
-complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from completions c" -a 'bash zsh fish' -d Shell
+complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from completions c" -a 'bash zsh fish nu' -d Shell
 
 complete -c rift -n "__fish_seen_subcommand_from list ls l" -l short -s s -d 'Short output'
 complete -c rift -n "__fish_seen_subcommand_from list ls l" -l verbose -s v -d 'Verbose output (uptime, log path)'
@@ -144,4 +145,63 @@ complete -c rift -n "__fish_seen_subcommand_from attach a" -s d -l detached -d '
 complete -c rift -n "__fish_seen_subcommand_from run r" -s d -l detached -d 'Run detached (background)'
 complete -c rift -n "__fish_seen_subcommand_from run r" -l fish -d 'Use fish shell completion detection'
 complete -c rift -n "__fish_seen_subcommand_from kill k" -s f -l force -d 'Force kill (SIGKILL)'
+"#;
+
+const NU: &str = r#"def "nu-complete rift sessions" [] {
+  rift list --short | lines
+}
+
+def "nu-complete rift shells" [] {
+  [bash zsh fish nu]
+}
+
+export extern "rift attach" [
+  name: string@"nu-complete rift sessions"
+  -d
+  ...rest: string
+]
+
+export extern "rift new" [
+  name: string
+  ...rest: string
+]
+
+export extern "rift run" [
+  name: string@"nu-complete rift sessions"
+  -d
+  --fish
+  ...rest: string
+]
+
+export extern "rift send" [
+  name: string@"nu-complete rift sessions"
+  ...text: string
+]
+
+export extern "rift print" [
+  name: string@"nu-complete rift sessions"
+  ...text: string
+]
+
+export extern "rift write" [
+  name: string@"nu-complete rift sessions"
+  path: path
+]
+
+export extern "rift kill" [
+  ...names: string@"nu-complete rift sessions"
+  --force(-f)
+]
+
+export extern "rift detach" [name?: string@"nu-complete rift sessions"]
+export extern "rift list" [--short(-s), --verbose(-v)]
+export extern "rift history" [name: string@"nu-complete rift sessions", --vt, --html]
+export extern "rift wait" [...names: string@"nu-complete rift sessions"]
+export extern "rift tail" [...names: string@"nu-complete rift sessions"]
+export extern "rift logs" [name: string@"nu-complete rift sessions", ...rest: string]
+export extern "rift rename" [name?: string@"nu-complete rift sessions", new_name: string]
+export extern "rift last" []
+export extern "rift version" []
+export extern "rift completions" [shell: string@"nu-complete rift shells"]
+export extern "rift help" []
 "#;

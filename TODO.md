@@ -9,6 +9,7 @@
 ## Scrapped
 
 ## Done
+- [x] Kitty keyboard flags survive detach via push/pop — push 0 at attach (outer flags preserved on the kbd stack as a side effect), pop 1 at detach. Beats query/set: inner-shell `CSI = u` SETs don't touch the stack, so the pop restores outer flags exactly regardless of what the session did, and there's no SSH-RTT query window to time out. Also robust Ctrl+\ detect across all kbd-flag combinations (alternate keys, event types, associated text), and 1016 SGR-pixel mouse added to the reset set #refactor
 - [x] Kitty keyboard flags survive detach — query outer-terminal flags at attach (`CSI ? u`, 80ms timeout) and re-set them on detach so an inner shell's `CSI = flags u` doesn't leak `N;5u` Ctrl-key sequences into the user's outer shell. Pop count on stack drain bumped from 1 to 99 #bug
 - [x] `rift last` self-heals — if the recorded session is gone, clear `.last` and fall back to the picker instead of erroring #improvement
 - [x] `list -v` / `--verbose` — adds uptime (derived from `created_at`) and log file path to each session line #improvement

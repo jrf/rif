@@ -234,7 +234,13 @@ fn main() {
     let cmd = parse_args();
     let code = match cmd {
         Command::Help => { print_help(); 0 }
-        Command::Version => { println!("rift {}", env!("CARGO_PKG_VERSION")); 0 }
+        Command::Version => {
+            let dir = socket::socket_dir();
+            println!("rift {}", env!("CARGO_PKG_VERSION"));
+            println!("socket dir: {}", dir.display());
+            println!("log dir:    {}", dir.join("logs").display());
+            0
+        }
         Command::List { short, verbose } => commands::cmd_list(short, verbose),
         Command::Kill { names, force } => commands::cmd_kill(&names, force),
         Command::Detach { name } => commands::cmd_detach(&name),
@@ -279,7 +285,7 @@ Usage:
   rift rename|rn [<old_name>] <new_name> Rename a session (defaults to $RIFT_SESSION)
   rift kill|k <name>...         Kill sessions (-f to force)
   rift wait|w <name>...         Wait for sessions to complete
-  rift completions|c <shell>    Print shell completions (bash, zsh, fish)
+  rift completions|c <shell>    Print shell completions (bash, zsh, fish, nu)
   rift version|v                Print version
   rift help|h                   Print this help
 

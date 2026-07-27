@@ -455,36 +455,59 @@ pub fn find_task_exit_marker(output: &[u8]) -> Option<u8> {
 
 // -- Kitty keyboard protocol --------------------------------------------------
 
-/// Detects Kitty keyboard protocol escape sequence for Ctrl+\
-/// 92 = backslash, 5 = ctrl modifier, :1 = key press event
+/// Detect Kitty keyboard protocol Ctrl+\ key events anywhere in `buf`.
+///
+/// The full event format is:
+///   CSI keycode[:alt[:base]][;modifiers[:event-type[:text-cps]][;text-as-cps]] u
+///
+/// With richer flags enabled by inner programs (report alternate keys = 4,
+/// report associated text = 16, report event types = 8), the same Ctrl+\ keypress
+/// can arrive in many shapes — `\x1b[92;5u`, `\x1b[92;5:1u`, `\x1b[92:X;5u`,
+/// `\x1b[92;5;92u`, etc. We accept any sequence whose first numeric field
+/// (before an optional `:`) is 92 and whose second numeric field (before an
+/// optional `:`) is 5 — that's "backslash, ctrl held," regardless of the
+/// alternate-keys / event-type / associated-text trimmings.
 pub fn is_kitty_ctrl_backslash(buf: &[u8]) -> bool {
-    buf.windows(7).any(|w| w == b"\x1b[92;5u") || buf.windows(9).any(|w| w == b"\x1b[92;5:1u")
+    let mut i = 0;
+    while i + 2 < buf.len() {
+        if buf[i] != 0x1b || buf[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        let body_start = i + 2;
+        let mut j = body_start;
+        while j < buf.len() && buf[j] != b'u' && buf[j] != 0x1b {
+            j += 1;
+        }
+        if j >= buf.len() || buf[j] != b'u' {
+            i += 1;
+            continue;
+        }
+        let body = &buf[body_start..j];
+        if kitty_event_is_ctrl_backslash(body) {
+            return true;
+        }
+        i = j + 1;
+    }
+    false
 }
 
-/// Find a kitty keyboard flags query response (`CSI ? <flags> u`) anywhere in
-/// `buf` and return the parsed flag byte. Other CSI responses don't end in
-/// `u`, so this is a safe filter even if mouse/focus reports are interleaved.
-pub fn parse_kitty_kbd_response(buf: &[u8]) -> Option<u8> {
-    let mut i = 0;
-    while i + 3 < buf.len() {
-        if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'?' {
-            let start = i + 3;
-            let mut end = start;
-            while end < buf.len() && buf[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end > start
-                && end < buf.len()
-                && buf[end] == b'u'
-                && let Ok(s) = std::str::from_utf8(&buf[start..end])
-                && let Ok(n) = s.parse::<u8>()
-            {
-                return Some(n);
-            }
-        }
-        i += 1;
-    }
-    None
+fn kitty_event_is_ctrl_backslash(body: &[u8]) -> bool {
+    let mut fields = body.split(|&b| b == b';');
+    let first = match fields.next() {
+        Some(f) => f,
+        None => return false,
+    };
+    let second = match fields.next() {
+        Some(f) => f,
+        None => return false,
+    };
+    leading_number(first) == Some(92) && leading_number(second) == Some(5)
+}
+
+fn leading_number(field: &[u8]) -> Option<u32> {
+    let end = field.iter().position(|&b| b == b':').unwrap_or(field.len());
+    std::str::from_utf8(&field[..end]).ok()?.parse().ok()
 }
 
 // -- Terminal serialization (vt100 crate) -------------------------------------

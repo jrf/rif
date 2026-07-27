@@ -38,7 +38,7 @@ rift detach [<session>]       Detach all clients (uses $RIFT_SESSION if no arg)
 rift rename [<old_name>] <new_name> Rename a session (defaults to $RIFT_SESSION)
 rift kill <name>... [-f]      Kill sessions (-f for SIGKILL)
 rift wait <name>...           Wait for sessions to complete
-rift completions <shell>      Print completions (bash, zsh, fish)
+rift completions <shell>      Print completions (bash, zsh, fish, nu)
 ```
 
 All subcommands have short aliases: `a`, `n`, `r`, `s`, `p`, `wr`, `t`, `hi`, `lg`, `la`, `d`, `rn`, `k`, `w`, `l`/`ls`, `c`, `v`, `h`.

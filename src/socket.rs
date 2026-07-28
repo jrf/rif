@@ -2,9 +2,9 @@ use std::io;
 use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::sys::socket::{
-    self as nix_socket, bind, connect, listen, AddressFamily, Backlog, SockFlag, SockType, UnixAddr,
+    self as nix_socket, AddressFamily, Backlog, SockFlag, SockType, UnixAddr, bind, connect, listen,
 };
 use nix::sys::stat::SFlag;
 
@@ -61,7 +61,10 @@ pub fn socket_dir() -> PathBuf {
         return PathBuf::from(xdg).join("rift");
     }
     if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".local").join("state").join("rift");
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("rift");
     }
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
     let tmpdir = tmpdir.trim_end_matches('/');
@@ -224,8 +227,8 @@ pub fn ensure_dirs(socket_dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(socket_dir)?;
     std::fs::create_dir_all(socket_dir.join("logs"))?;
     use std::os::unix::fs::PermissionsExt;
-    let dir_mode = parse_mode_env("RIFT_DIR_MODE", 0o750);
-    let log_mode = parse_mode_env("RIFT_LOG_MODE", 0o640);
+    let dir_mode = dir_mode();
+    let log_mode = log_mode();
     let _ = std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(dir_mode));
     let _ = std::fs::set_permissions(
         socket_dir.join("logs"),
@@ -239,6 +242,14 @@ pub fn ensure_dirs(socket_dir: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn dir_mode() -> u32 {
+    parse_mode_env("RIFT_DIR_MODE", 0o700)
+}
+
+pub fn log_mode() -> u32 {
+    parse_mode_env("RIFT_LOG_MODE", 0o600)
 }
 
 fn parse_mode_env(name: &str, default: u32) -> u32 {

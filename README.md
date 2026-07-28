@@ -76,8 +76,8 @@ rift list
 | `RIFT_SESSION_PREFIX` | Prefix applied to session names (for grouping) |
 | `RIFT_SHELL` | Override the shell to spawn (default: `$SHELL`, fallback: `/bin/sh`) |
 | `RIFT_DIR` | Override the socket directory (default: `$XDG_RUNTIME_DIR/rift`, else `$HOME/.local/state/rift`) |
-| `RIFT_DIR_MODE` | Permission mode for socket directory |
-| `RIFT_LOG_MODE` | Permission mode for log files |
+| `RIFT_DIR_MODE` | Permission mode for socket directory (default: `0700`) |
+| `RIFT_LOG_MODE` | Permission mode for log files (default: `0600`) |
 | `RIFT_EMPTY_TIMEOUT` | Idle duration (in seconds) after which a detached session with 0 clients will automatically terminate (e.g., `3600` for 1 hour) |
 | `RIFT_PICKER` | Shell command to use as session picker when `rift` is run with no args (e.g., `fzf`); receives session names on stdin, must print selection on stdout. Default: built-in numbered prompt. |
 | `RIFT_ON_ATTACH` | Shell snippet run when a client attaches (fire-and-forget, stdio detached). `$RIFT_SESSION` is set and the session name is also passed as `$1`. |

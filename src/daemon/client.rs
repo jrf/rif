@@ -11,7 +11,7 @@ use nix::sys::termios::{self, FlushArg, SetArg, Termios};
 use nix::unistd;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::ipc::{self, RiftCodec, Tag};
@@ -101,7 +101,7 @@ struct NonBlockGuard {
 
 impl Drop for NonBlockGuard {
     fn drop(&mut self) {
-        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
         let bfd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         if let Ok(fl) = fcntl(bfd, FcntlArg::F_GETFL) {
             let fl = OFlag::from_bits_truncate(fl) & !OFlag::O_NONBLOCK;

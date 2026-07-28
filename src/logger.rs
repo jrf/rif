@@ -28,10 +28,7 @@ impl LogSystem {
     }
 
     pub fn init(&self, path: &Path) -> std::io::Result<()> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
 
         let current_size = file.metadata()?.len();
 
@@ -40,11 +37,12 @@ impl LogSystem {
         inner.current_size = current_size;
         inner.path = path.to_path_buf();
 
-        // Set file permissions to 0o640
+        // Apply the configured log mode after creation as well as at startup.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o640));
+            let _ =
+                fs::set_permissions(path, fs::Permissions::from_mode(crate::socket::log_mode()));
         }
 
         Ok(())
@@ -76,9 +74,10 @@ impl LogSystem {
         let len = line.len() as u64;
 
         if let Some(ref mut f) = inner.file
-            && f.write_all(line.as_bytes()).is_ok() {
-                inner.current_size += len;
-            }
+            && f.write_all(line.as_bytes()).is_ok()
+        {
+            inner.current_size += len;
+        }
     }
 }
 
@@ -103,7 +102,10 @@ fn rotate(inner: &mut LogInner) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&inner.path, fs::Permissions::from_mode(0o640));
+        let _ = fs::set_permissions(
+            &inner.path,
+            fs::Permissions::from_mode(crate::socket::log_mode()),
+        );
     }
 
     inner.file = Some(file);

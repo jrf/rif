@@ -1,14 +1,23 @@
 use std::io;
 use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::Signal;
 
 use crate::daemon::{self, Cfg};
 use crate::ipc::{self, SocketBuffer, Tag};
 use crate::socket;
 use crate::util;
+
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_request_id() -> u64 {
+    let counter = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id() as u64;
+    (pid << 32) | counter
+}
 
 // ---------------------------------------------------------------------------
 // list
@@ -288,9 +297,10 @@ pub fn cmd_wait(names: &[String]) -> i32 {
             match session.task_ended_at {
                 Some(t) if t > 0 => {
                     if let Some(code) = session.task_exit_code
-                        && code != 0 {
-                            last_exit_code = code as i32;
-                        }
+                        && code != 0
+                    {
+                        last_exit_code = code as i32;
+                    }
                 }
                 _ => {
                     eprintln!("still waiting task={}", session.name);
@@ -382,10 +392,17 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
         .collect::<Vec<_>>()
         .join(" ");
 
+    let request_id = next_request_id();
     let wrapped = if fish {
-        format!("{}; printf 'RIFT_TASK_COMPLETED:%d' $status\n", cmd_str)
+        format!(
+            "{}; set __rift_status $status; printf '\\nRIFT_TASK_REQUEST_COMPLETED:{}:%d\\n' $__rift_status; printf 'RIFT_TASK_%s:%d\\n' COMPLETED $__rift_status\n",
+            cmd_str, request_id
+        )
     } else {
-        format!("{}; printf 'RIFT_TASK_COMPLETED:%d' $?\n", cmd_str)
+        format!(
+            "{}; __rift_status=$?; printf '\\nRIFT_TASK_REQUEST_COMPLETED:{}:%d\\n' \"$__rift_status\"; printf 'RIFT_TASK_%s:%d\\n' COMPLETED \"$__rift_status\"\n",
+            cmd_str, request_id
+        )
     };
 
     if let Err(e) = ipc::send(socket_fd.as_raw_fd(), Tag::Run, wrapped.as_bytes()) {
@@ -399,6 +416,7 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
 
     daemon::ignore_signal(Signal::SIGPIPE);
     let mut socket_buf = SocketBuffer::new();
+    let mut task_scan_carry = Vec::new();
     let stdout_fd: RawFd = 1;
 
     loop {
@@ -415,8 +433,31 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
             Ok(0) => break,
             Ok(_) => {
                 while let Some((tag, payload)) = socket_buf.next() {
-                    if tag == Tag::Output {
-                        let _ = ipc::write_all(stdout_fd, payload);
+                    match tag {
+                        Tag::Output => {
+                            let completions =
+                                util::scan_task_completions(&mut task_scan_carry, payload);
+                            let responses = util::device_attribute_responses(payload);
+                            if !responses.is_empty() {
+                                let _ = ipc::send(socket_fd.as_raw_fd(), Tag::Input, &responses);
+                            }
+                            let _ = ipc::write_all(stdout_fd, payload);
+                            if let Some((_, exit_code)) = completions
+                                .into_iter()
+                                .find(|(completed_id, _)| *completed_id == request_id)
+                            {
+                                return exit_code as i32;
+                            }
+                        }
+                        Tag::TaskComplete => {
+                            if let Some((completed_id, exit_code)) =
+                                ipc::decode_task_complete(payload)
+                                && completed_id == request_id
+                            {
+                                return exit_code as i32;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -617,14 +658,17 @@ pub fn cmd_tail(names: &[String]) -> i32 {
         }
 
         if let Some(revents) = poll_fds[0].revents()
-            && revents.contains(PollFlags::POLLIN) {
-                let mut buf = [0u8; 128];
-                let stdin_bfd = unsafe { BorrowedFd::borrow_raw(0) };
-                if let Ok(n) = nix::unistd::read(stdin_bfd, &mut buf)
-                    && n > 0 && buf[..n].contains(&0x03) {
-                        return 0;
-                    }
+            && revents.contains(PollFlags::POLLIN)
+        {
+            let mut buf = [0u8; 128];
+            let stdin_bfd = unsafe { BorrowedFd::borrow_raw(0) };
+            if let Ok(n) = nix::unistd::read(stdin_bfd, &mut buf)
+                && n > 0
+                && buf[..n].contains(&0x03)
+            {
+                return 0;
             }
+        }
 
         let mut closed = Vec::new();
         for i in 0..fds.len() {

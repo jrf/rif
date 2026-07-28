@@ -7,12 +7,12 @@ use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawF
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::Signal;
 use nix::unistd;
 use tokio::io::unix::AsyncFd;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration, Instant};
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -21,7 +21,7 @@ use crate::ipc::{self, RiftCodec, Tag};
 use crate::socket;
 use crate::util;
 
-use super::{ignore_signal, Cfg};
+use super::{Cfg, ignore_signal};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -169,7 +169,10 @@ fn spawn_pty(
 
 /// Message from a client task back to the daemon main task.
 enum ClientMsg {
-    Frame { tag: Tag, payload: Vec<u8> },
+    Frame {
+        tag: Tag,
+        payload: Vec<u8>,
+    },
     /// Read loop ended (socket EOF, error, or write task crashed).
     Gone,
 }
@@ -202,6 +205,8 @@ struct DaemonState {
     child_exited: bool,
     has_had_client: bool,
     clients: HashMap<u64, mpsc::Sender<DaemonFrame>>,
+    pending_runs: HashMap<u64, u64>,
+    task_scan_carry: Vec<u8>,
     next_client_id: u64,
     last_client_disconnected_at: Option<u64>,
     empty_timeout: Option<u64>,
@@ -266,10 +271,23 @@ impl DaemonState {
     /// (so the caller should answer any pending DA queries directly).
     fn on_pty_bytes(&mut self, data: &[u8]) -> bool {
         self.parser.process(data);
-        if let Some(code) = util::find_task_exit_marker(data) {
+        for (request_id, code) in util::scan_task_completions(&mut self.task_scan_carry, data) {
             self.task_exit_code = code;
             self.task_ended_at = now_epoch();
-            log::info!("task exit marker found, code={}", code);
+            log::info!(
+                "task completed, request_id={} exit_code={}",
+                request_id,
+                code
+            );
+            if let Some(client_id) = self.pending_runs.remove(&request_id) {
+                self.send_to(
+                    client_id,
+                    DaemonFrame {
+                        tag: Tag::TaskComplete,
+                        payload: ipc::encode_task_complete(request_id, code),
+                    },
+                );
+            }
         }
         self.broadcast(DaemonFrame {
             tag: Tag::Output,
@@ -332,11 +350,7 @@ impl DaemonState {
             log::error!("rename failed: failed to rename socket: {}", e);
             return;
         }
-        log::info!(
-            "session renamed: '{}' -> '{}'",
-            self.session_name,
-            new_name
-        );
+        log::info!("session renamed: '{}' -> '{}'", self.session_name, new_name);
 
         // SSH-auth-sock: repoint the new-name symlink at the same target the
         // old one had, then make the old name a symlink to the new one so
@@ -450,33 +464,55 @@ impl DaemonState {
                     },
                 );
             }
-            Tag::Print
-                if !payload.is_empty() => {
-                    self.parser.process(&payload);
-                    self.broadcast(DaemonFrame {
-                        tag: Tag::Output,
-                        payload: Bytes::copy_from_slice(&payload),
-                    });
+            Tag::Print if !payload.is_empty() => {
+                self.parser.process(&payload);
+                self.broadcast(DaemonFrame {
+                    tag: Tag::Output,
+                    payload: Bytes::copy_from_slice(&payload),
+                });
+            }
+            Tag::Run if !payload.is_empty() => {
+                let request_id = util::task_request_id(&payload);
+                if let Some(request_id) = request_id {
+                    self.pending_runs.insert(request_id, id);
                 }
-            Tag::Run
-                if !payload.is_empty() => {
-                    let _ = ipc::write_all(self.pty_master_fd, &payload);
+                if let Err(error) = ipc::write_all(self.pty_master_fd, &payload) {
+                    if let Some(request_id) = request_id {
+                        self.pending_runs.remove(&request_id);
+                        log::warn!(
+                            "failed to write run request {} to pty: {}",
+                            request_id,
+                            error
+                        );
+                        self.send_to(
+                            id,
+                            DaemonFrame {
+                                tag: Tag::TaskComplete,
+                                payload: ipc::encode_task_complete(request_id, 255),
+                            },
+                        );
+                    } else {
+                        log::warn!("failed to write untracked run request to pty: {}", error);
+                    }
                 }
+            }
             Tag::SshAuthSock => {
                 if !payload.is_empty()
-                    && let Ok(path) = std::str::from_utf8(&payload) {
-                        socket::update_ssh_auth_sock_symlink(
-                            &self.socket_dir,
-                            &self.session_name,
-                            path,
-                        );
-                    }
+                    && let Ok(path) = std::str::from_utf8(&payload)
+                {
+                    socket::update_ssh_auth_sock_symlink(
+                        &self.socket_dir,
+                        &self.session_name,
+                        path,
+                    );
+                }
             }
             Tag::Rename => {
                 if let Ok(new_name) = std::str::from_utf8(&payload)
-                    && !new_name.is_empty() {
-                        self.rename_session(new_name);
-                    }
+                    && !new_name.is_empty()
+                {
+                    self.rename_session(new_name);
+                }
             }
             _ => {}
         }
@@ -506,9 +542,10 @@ async fn client_task(
 
     let write_join = tokio::task::spawn_local(async move {
         if let Some(initial) = initial
-            && writer.send((initial.tag, initial.payload)).await.is_err() {
-                return;
-            }
+            && writer.send((initial.tag, initial.payload)).await.is_err()
+        {
+            return;
+        }
         while let Some(frame) = rx.recv().await {
             if writer.send((frame.tag, frame.payload)).await.is_err() {
                 break;
@@ -684,9 +721,10 @@ async fn daemon_main(mut state: DaemonState, listener: UnixListener, pty_master:
             // attached clients before we tear down.
             let bfd = unsafe { BorrowedFd::borrow_raw(state.pty_master_fd) };
             if let Ok(n) = unistd::read(bfd, &mut pty_buf)
-                && n > 0 {
-                    state.on_pty_bytes(&pty_buf[..n]);
-                }
+                && n > 0
+            {
+                state.on_pty_bytes(&pty_buf[..n]);
+            }
             break;
         }
     }
@@ -703,7 +741,9 @@ async fn daemon_main(mut state: DaemonState, listener: UnixListener, pty_master:
     // Clean up current active socket and symlink
     let active_socket = state.socket_dir.join(&state.session_name);
     let _ = std::fs::remove_file(active_socket);
-    let active_symlink = state.socket_dir.join(format!("{}.ssh-auth-sock", state.session_name));
+    let active_symlink = state
+        .socket_dir
+        .join(format!("{}.ssh-auth-sock", state.session_name));
     let _ = std::fs::remove_file(active_symlink);
 
     // Clean up any historical/old symlinks left behind by rename
@@ -737,15 +777,15 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
     } else {
         cmd[1..].iter().map(|s| s.as_str()).collect()
     };
-    let (master_fd, child_pid) =
-        match spawn_pty(spawn_cmd, &spawn_args, 24, 80, &cfg.session_name) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("error: failed to spawn pty: {}", e);
-                let _ = std::fs::remove_file(&cfg.socket_path);
-                return;
-            }
-        };
+    let (master_fd, child_pid) = match spawn_pty(spawn_cmd, &spawn_args, 24, 80, &cfg.session_name)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: failed to spawn pty: {}", e);
+            let _ = std::fs::remove_file(&cfg.socket_path);
+            return;
+        }
+    };
 
     let early_output = drain_da_queries(master_fd);
 
@@ -791,6 +831,8 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
         child_exited: false,
         has_had_client: false,
         clients: HashMap::new(),
+        pending_runs: HashMap::new(),
+        task_scan_carry: Vec::new(),
         next_client_id: 0,
         last_client_disconnected_at: None,
         empty_timeout,

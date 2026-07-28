@@ -3,7 +3,7 @@ use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::unistd;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -22,6 +22,7 @@ pub enum Tag {
     Init = 7,
     History = 8,
     Run = 9,
+    TaskComplete = 10,
     Print = 14,
     SshAuthSock = 15,
     Rename = 16,
@@ -40,6 +41,7 @@ impl Tag {
             7 => Some(Tag::Init),
             8 => Some(Tag::History),
             9 => Some(Tag::Run),
+            10 => Some(Tag::TaskComplete),
             14 => Some(Tag::Print),
             15 => Some(Tag::SshAuthSock),
             16 => Some(Tag::Rename),
@@ -49,6 +51,23 @@ impl Tag {
 }
 
 pub const HEADER_SIZE: usize = 5; // 1 byte tag + 4 bytes len
+pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+pub const REQUEST_ID_SIZE: usize = std::mem::size_of::<u64>();
+
+pub fn encode_task_complete(request_id: u64, exit_code: u8) -> Bytes {
+    let mut payload = Vec::with_capacity(REQUEST_ID_SIZE + 1);
+    payload.extend_from_slice(&request_id.to_le_bytes());
+    payload.push(exit_code);
+    Bytes::from(payload)
+}
+
+pub fn decode_task_complete(payload: &[u8]) -> Option<(u64, u8)> {
+    if payload.len() != REQUEST_ID_SIZE + 1 {
+        return None;
+    }
+    let request_id = u64::from_le_bytes(payload[..REQUEST_ID_SIZE].try_into().ok()?);
+    Some((request_id, payload[REQUEST_ID_SIZE]))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Resize {
@@ -164,6 +183,12 @@ fn decode_header(data: &[u8]) -> (u8, u32) {
 }
 
 pub fn send(fd: RawFd, tag: Tag, data: &[u8]) -> io::Result<()> {
+    if data.len() > MAX_FRAME_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame exceeds maximum size",
+        ));
+    }
     let header = encode_header(tag, data.len() as u32);
     let mut msg = Vec::with_capacity(HEADER_SIZE + data.len());
     msg.extend_from_slice(&header);
@@ -235,6 +260,11 @@ impl SocketBuffer {
 
         let (tag_byte, len) = decode_header(available);
         let total = HEADER_SIZE + len as usize;
+        if len as usize > MAX_FRAME_SIZE {
+            self.buf.clear();
+            self.head = 0;
+            return None;
+        }
         if available.len() < total {
             return None;
         }
@@ -307,9 +337,10 @@ pub fn probe_session(socket_path: &str) -> Result<ProbeResult, ProbeError> {
 
         while let Some((tag, payload)) = sb.next() {
             if tag == Tag::Info
-                && let Some(info) = Info::decode(payload) {
-                    return Ok(ProbeResult { fd, info });
-                }
+                && let Some(info) = Info::decode(payload)
+            {
+                return Ok(ProbeResult { fd, info });
+            }
         }
     }
 }
@@ -332,6 +363,12 @@ impl Decoder for RiftCodec {
             return Ok(None);
         }
         let len = u32::from_le_bytes([src[1], src[2], src[3], src[4]]) as usize;
+        if len > MAX_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame exceeds maximum size",
+            ));
+        }
         let total = HEADER_SIZE + len;
         if src.len() < total {
             src.reserve(total - src.len());
@@ -349,10 +386,72 @@ impl Encoder<(Tag, Bytes)> for RiftCodec {
 
     fn encode(&mut self, item: (Tag, Bytes), dst: &mut BytesMut) -> Result<(), Self::Error> {
         let (tag, payload) = item;
+        if payload.len() > MAX_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frame exceeds maximum size",
+            ));
+        }
         dst.reserve(HEADER_SIZE + payload.len());
         dst.put_u8(tag as u8);
         dst.put_u32_le(payload.len() as u32);
         dst.extend_from_slice(&payload);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn info_round_trips() {
+        let info = Info {
+            clients_len: 3,
+            pid: 1234,
+            created_at: 10,
+            task_ended_at: 20,
+            task_exit_code: 7,
+            cmd: b"cargo test".to_vec(),
+            cwd: b"/tmp/project".to_vec(),
+        };
+        let decoded = Info::decode(&info.encode()).expect("valid info payload");
+        assert_eq!(decoded.clients_len, info.clients_len);
+        assert_eq!(decoded.pid, info.pid);
+        assert_eq!(decoded.created_at, info.created_at);
+        assert_eq!(decoded.task_ended_at, info.task_ended_at);
+        assert_eq!(decoded.task_exit_code, info.task_exit_code);
+        assert_eq!(decoded.cmd, info.cmd);
+        assert_eq!(decoded.cwd, info.cwd);
+    }
+
+    #[test]
+    fn task_completion_round_trips() {
+        let completion = encode_task_complete(99, 2);
+        assert_eq!(decode_task_complete(&completion), Some((99, 2)));
+    }
+
+    #[test]
+    fn codec_rejects_oversized_frame_before_reserving_payload() {
+        let mut encoded = BytesMut::new();
+        encoded.put_u8(Tag::Input as u8);
+        encoded.put_u32_le((MAX_FRAME_SIZE as u32) + 1);
+
+        let error = RiftCodec
+            .decode(&mut encoded)
+            .expect_err("oversized frame must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn codec_round_trips_frame() {
+        let mut encoded = BytesMut::new();
+        RiftCodec
+            .encode((Tag::Output, Bytes::from_static(b"hello")), &mut encoded)
+            .expect("encode");
+        assert_eq!(
+            RiftCodec.decode(&mut encoded).expect("decode"),
+            Some((Tag::Output, Bytes::from_static(b"hello")))
+        );
     }
 }

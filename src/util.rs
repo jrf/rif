@@ -196,12 +196,13 @@ pub fn write_session_line(
         write!(w, "\tcmd={}", cmd)?;
     }
     if let Some(ended_at) = session.task_ended_at
-        && ended_at > 0 {
-            write!(w, "\tended={}", ended_at)?;
-            if let Some(exit_code) = session.task_exit_code {
-                write!(w, "\texit_code={}", exit_code)?;
-            }
+        && ended_at > 0
+    {
+        write!(w, "\tended={}", ended_at)?;
+        if let Some(exit_code) = session.task_exit_code {
+            write!(w, "\texit_code={}", exit_code)?;
         }
+    }
     if verbose {
         if session.created_at > 0 {
             let now = std::time::SystemTime::now()
@@ -408,7 +409,21 @@ const DA2_RESPONSE: &[u8] = b"\x1b[>1;10;0c";
 /// Handles the case where no client is attached (e.g. rift run) and the shell
 /// sends a DA query that would otherwise go unanswered.
 pub fn respond_to_device_attributes(pty_fd: RawFd, data: &[u8]) {
+    let responses = device_attribute_responses(data);
+    if responses.is_empty() {
+        return;
+    }
     let bfd = unsafe { BorrowedFd::borrow_raw(pty_fd) };
+    let _ = unistd::write(bfd, &responses);
+}
+
+/// Build terminal capability responses for DA queries found in output.
+///
+/// Interactive clients normally let the real terminal answer these. Headless
+/// clients such as `rift run` send these bytes back as PTY input so shell
+/// startup does not stall waiting for a terminal.
+pub fn device_attribute_responses(data: &[u8]) -> Vec<u8> {
+    let mut responses = Vec::new();
     let mut i = 0;
     while i < data.len() {
         if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'[' {
@@ -418,39 +433,99 @@ pub fn respond_to_device_attributes(pty_fd: RawFd, data: &[u8]) {
                 continue;
             }
             if data[i..].starts_with(DA2_QUERY) || data[i..].starts_with(DA2_QUERY_EXPLICIT) {
-                let _ = unistd::write(bfd, DA2_RESPONSE);
+                responses.extend_from_slice(DA2_RESPONSE);
             } else if data[i..].starts_with(DA1_QUERY) || data[i..].starts_with(DA1_QUERY_EXPLICIT)
             {
-                let _ = unistd::write(bfd, DA1_RESPONSE);
+                responses.extend_from_slice(DA1_RESPONSE);
             }
         }
         i += 1;
     }
+    responses
 }
 
 // -- Task exit markers --------------------------------------------------------
 
-const TASK_MARKER: &str = "RIFT_TASK_COMPLETED:";
+const TASK_MARKER: &[u8] = b"RIFT_TASK_REQUEST_COMPLETED:";
+const TASK_SCAN_LIMIT: usize = 1024;
 
-pub fn find_task_exit_marker(output: &[u8]) -> Option<u8> {
-    let marker = TASK_MARKER.as_bytes();
-    if let Some(idx) = output.windows(marker.len()).position(|w| w == marker) {
-        let after = &output[idx + marker.len()..];
-        let end = after
+/// Extract the request ID embedded in a wrapped `Run` command.
+///
+/// Keeping the command itself as the `Run` payload preserves compatibility
+/// with daemons started by older rift binaries.
+pub fn task_request_id(command: &[u8]) -> Option<u64> {
+    let marker_start = command
+        .windows(TASK_MARKER.len())
+        .position(|window| window == TASK_MARKER)?;
+    let id_start = marker_start + TASK_MARKER.len();
+    let id_end = command[id_start..]
+        .iter()
+        .position(|&byte| byte == b':')
+        .map(|offset| id_start + offset)?;
+    std::str::from_utf8(&command[id_start..id_end])
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// Incrementally scan PTY output for task completion records.
+///
+/// Records have the form
+/// `RIFT_TASK_REQUEST_COMPLETED:<request_id>:<exit_code>` and must end in CR
+/// or LF. Keeping a small carry buffer makes detection robust when a record is
+/// split across PTY reads. Invalid occurrences are skipped; this matters
+/// because an interactive shell may echo the `printf` command containing the
+/// marker before emitting the actual completion record.
+pub fn scan_task_completions(carry: &mut Vec<u8>, output: &[u8]) -> Vec<(u64, u8)> {
+    carry.extend_from_slice(output);
+    let mut completions = Vec::new();
+    let mut search_from = 0;
+    let mut consumed = 0;
+
+    while search_from + TASK_MARKER.len() <= carry.len() {
+        let Some(relative) = carry[search_from..]
+            .windows(TASK_MARKER.len())
+            .position(|window| window == TASK_MARKER)
+        else {
+            break;
+        };
+        let marker_start = search_from + relative;
+        let record_start = marker_start + TASK_MARKER.len();
+        let Some(relative_end) = carry[record_start..]
             .iter()
-            .position(|&b| b == b'\n' || b == b'\r')
-            .unwrap_or(after.len());
-        let code_str = std::str::from_utf8(&after[..end]).ok()?;
-        match code_str.parse::<u8>() {
-            Ok(code) => Some(code),
-            Err(_) => {
-                log::warn!("failed to parse task exit code from: {}", code_str);
-                None
+            .position(|&byte| byte == b'\n' || byte == b'\r')
+        else {
+            consumed = marker_start;
+            break;
+        };
+        let record_end = record_start + relative_end;
+        let record = &carry[record_start..record_end];
+
+        if let Some(colon) = record.iter().position(|&byte| byte == b':') {
+            let request = std::str::from_utf8(&record[..colon])
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok());
+            let code = std::str::from_utf8(&record[colon + 1..])
+                .ok()
+                .and_then(|value| value.parse::<u8>().ok());
+            if let (Some(request), Some(code)) = (request, code) {
+                completions.push((request, code));
             }
         }
-    } else {
-        None
+
+        search_from = record_end + 1;
+        consumed = search_from;
     }
+
+    if consumed > 0 {
+        carry.drain(..consumed);
+    }
+    if carry.len() > TASK_SCAN_LIMIT {
+        let keep = TASK_MARKER.len().saturating_sub(1);
+        carry.drain(..carry.len().saturating_sub(keep));
+    }
+
+    completions
 }
 
 // -- Kitty keyboard protocol --------------------------------------------------
@@ -516,11 +591,7 @@ fn leading_number(field: &[u8]) -> Option<u32> {
 /// Returns the VT escape sequences needed to reproduce the screen.
 pub fn serialize_terminal_state(parser: &vt100::Parser) -> Option<Vec<u8>> {
     let data = parser.screen().state_formatted();
-    if data.is_empty() {
-        None
-    } else {
-        Some(data)
-    }
+    if data.is_empty() { None } else { Some(data) }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,11 +614,7 @@ pub fn serialize_terminal(parser: &vt100::Parser, format: HistoryFormat) -> Opti
             serialize_html(screen)
         }
     };
-    if data.is_empty() {
-        None
-    } else {
-        Some(data)
-    }
+    if data.is_empty() { None } else { Some(data) }
 }
 
 fn serialize_html(screen: &vt100::Screen) -> Vec<u8> {
@@ -649,4 +716,62 @@ pub fn filter_tail_output(data: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_completion_scanner_handles_split_records() {
+        let mut carry = Vec::new();
+        assert!(scan_task_completions(&mut carry, b"output\nRIFT_TASK_REQUEST_COMP").is_empty());
+        assert_eq!(
+            scan_task_completions(&mut carry, b"LETED:42:7\r\nprompt"),
+            vec![(42, 7)]
+        );
+    }
+
+    #[test]
+    fn task_request_id_is_extracted_from_wrapped_command() {
+        assert_eq!(
+            task_request_id(b"printf 'RIFT_TASK_REQUEST_COMPLETED:1234:%d\\n' \"$status\""),
+            Some(1234)
+        );
+    }
+
+    #[test]
+    fn task_completion_scanner_skips_echoed_printf_and_finds_multiple_records() {
+        let mut carry = Vec::new();
+        let output = concat!(
+            "printf '\\nRIFT_TASK_REQUEST_COMPLETED:19:%d\\n' \"$status\"\r\n",
+            "\r\nRIFT_TASK_REQUEST_COMPLETED:19:0\r\n",
+            "RIFT_TASK_REQUEST_COMPLETED:20:127\n"
+        );
+        assert_eq!(
+            scan_task_completions(&mut carry, output.as_bytes()),
+            vec![(19, 0), (20, 127)]
+        );
+    }
+
+    #[test]
+    fn shell_quote_handles_single_quotes() {
+        assert_eq!(shell_quote("it's safe"), "'it'\\''s safe'");
+    }
+
+    #[test]
+    fn terminal_tail_filter_preserves_color_but_removes_cursor_motion() {
+        assert_eq!(
+            filter_tail_output(b"\x1b[31mred\x1b[0m\x1b[2Aup"),
+            b"\x1b[31mred\x1b[0mup"
+        );
+    }
+
+    #[test]
+    fn device_attribute_queries_produce_terminal_responses() {
+        assert_eq!(
+            device_attribute_responses(b"one\x1b[c two\x1b[>0c"),
+            [DA1_RESPONSE, DA2_RESPONSE].concat()
+        );
+    }
 }

@@ -12,25 +12,98 @@ use crate::util::HistoryFormat;
 // CLI parsing
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, PartialEq, Eq)]
 enum Command {
-    Attach { name: String, detached: bool, cmd: Vec<String> },
-    List { short: bool, verbose: bool },
-    Run { name: String, cmd: Vec<String>, detached: bool, fish: bool },
-    Send { name: String, text: Vec<String> },
-    Tail { names: Vec<String> },
-    Kill { names: Vec<String>, force: bool },
-    Print { name: String, text: Vec<String> },
-    Write { name: String, path: String },
-    Detach { name: String },
-    History { name: String, format: HistoryFormat },
-    Rename { name: String, new_name: String },
-    Wait { names: Vec<String> },
-    Completions { shell: String },
-    Logs { name: String, extra: Vec<String> },
+    Attach {
+        name: String,
+        detached: bool,
+        cmd: Vec<String>,
+    },
+    List {
+        short: bool,
+        verbose: bool,
+    },
+    Run {
+        name: String,
+        cmd: Vec<String>,
+        detached: bool,
+        fish: bool,
+    },
+    Send {
+        name: String,
+        text: Vec<String>,
+    },
+    Tail {
+        names: Vec<String>,
+    },
+    Kill {
+        names: Vec<String>,
+        force: bool,
+    },
+    Print {
+        name: String,
+        text: Vec<String>,
+    },
+    Write {
+        name: String,
+        path: String,
+    },
+    Detach {
+        name: String,
+    },
+    History {
+        name: String,
+        format: HistoryFormat,
+    },
+    Rename {
+        name: String,
+        new_name: String,
+    },
+    Wait {
+        names: Vec<String>,
+    },
+    Completions {
+        shell: String,
+    },
+    Logs {
+        name: String,
+        extra: Vec<String>,
+    },
     Last,
     Pick,
     Version,
     Help,
+}
+
+fn parse_session_command(
+    args: &[String],
+    allow_detached: bool,
+    allow_fish: bool,
+) -> Result<(String, Vec<String>, bool, bool), String> {
+    let mut detached = false;
+    let mut fish = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "-d" | "--detached" if allow_detached => detached = true,
+            "--fish" if allow_fish => fish = true,
+            option if option.starts_with('-') => {
+                return Err(format!("unknown option '{}'", option));
+            }
+            _ => break,
+        }
+        index += 1;
+    }
+
+    let Some(name) = args.get(index) else {
+        return Err("session name required".to_string());
+    };
+    Ok((name.clone(), args[index + 1..].to_vec(), detached, fish))
 }
 
 fn parse_args() -> Command {
@@ -55,7 +128,8 @@ fn parse_args() -> Command {
                 std::process::exit(1);
             }
             let force = args.iter().any(|a| a == "-f" || a == "--force");
-            let names: Vec<String> = args[1..].iter()
+            let names: Vec<String> = args[1..]
+                .iter()
                 .filter(|a| !a.starts_with('-'))
                 .cloned()
                 .collect();
@@ -79,23 +153,17 @@ fn parse_args() -> Command {
             Command::Detach { name }
         }
         "run" | "r" => {
-            if args.len() < 2 {
-                eprintln!("error: run requires a session name");
-                std::process::exit(1);
+            let (name, cmd, detached, fish) = parse_session_command(&args[1..], true, true)
+                .unwrap_or_else(|error| {
+                    eprintln!("error: run {}", error);
+                    std::process::exit(1);
+                });
+            Command::Run {
+                name,
+                cmd,
+                detached,
+                fish,
             }
-            let detached = args.iter().any(|a| a == "-d" || a == "--detached");
-            let fish = args.iter().any(|a| a == "--fish");
-            let positional: Vec<String> = args[1..].iter()
-                .filter(|a| !a.starts_with('-'))
-                .cloned()
-                .collect();
-            if positional.is_empty() {
-                eprintln!("error: run requires a session name");
-                std::process::exit(1);
-            }
-            let name = positional[0].clone();
-            let cmd = positional[1..].to_vec();
-            Command::Run { name, cmd, detached, fish }
         }
         "send" | "s" => {
             if args.len() < 2 {
@@ -120,14 +188,19 @@ fn parse_args() -> Command {
                 eprintln!("error: write requires a session name and file path");
                 std::process::exit(1);
             }
-            Command::Write { name: args[1].clone(), path: args[2].clone() }
+            Command::Write {
+                name: args[1].clone(),
+                path: args[2].clone(),
+            }
         }
         "tail" | "t" => {
             if args.len() < 2 {
                 eprintln!("error: tail requires a session name");
                 std::process::exit(1);
             }
-            Command::Tail { names: args[1..].to_vec() }
+            Command::Tail {
+                names: args[1..].to_vec(),
+            }
         }
         "history" | "hi" => {
             let mut session_name: Option<String> = None;
@@ -173,7 +246,9 @@ fn parse_args() -> Command {
                 eprintln!("error: completions requires a shell name (bash, zsh, fish)");
                 std::process::exit(1);
             }
-            Command::Completions { shell: args[1].clone() }
+            Command::Completions {
+                shell: args[1].clone(),
+            }
         }
         "logs" | "lg" => {
             if args.len() < 2 {
@@ -186,42 +261,39 @@ fn parse_args() -> Command {
         }
         "last" | "la" => Command::Last,
         "new" | "n" => {
-            if args.len() < 2 {
-                eprintln!("error: new requires a session name");
-                std::process::exit(1);
+            let (name, cmd, _, _) =
+                parse_session_command(&args[1..], false, false).unwrap_or_else(|error| {
+                    eprintln!("error: new {}", error);
+                    std::process::exit(1);
+                });
+            Command::Attach {
+                name,
+                detached: true,
+                cmd,
             }
-            let positional: Vec<String> = args[1..].iter()
-                .filter(|a| !a.starts_with('-'))
-                .cloned()
-                .collect();
-            let name = positional[0].clone();
-            let cmd = positional[1..].to_vec();
-            Command::Attach { name, detached: true, cmd }
         }
         "attach" | "a" => {
-            if args.len() < 2 {
-                eprintln!("error: attach requires a session name");
-                std::process::exit(1);
+            let (name, cmd, detached, _) = parse_session_command(&args[1..], true, false)
+                .unwrap_or_else(|error| {
+                    eprintln!("error: attach {}", error);
+                    std::process::exit(1);
+                });
+            Command::Attach {
+                name,
+                detached,
+                cmd,
             }
-            let detached = args.iter().any(|a| a == "-d" || a == "--detached");
-            let positional: Vec<String> = args[1..].iter()
-                .filter(|a| !a.starts_with('-'))
-                .cloned()
-                .collect();
-            if positional.is_empty() {
-                eprintln!("error: attach requires a session name");
-                std::process::exit(1);
-            }
-            let name = positional[0].clone();
-            let cmd = positional[1..].to_vec();
-            Command::Attach { name, detached, cmd }
         }
         name => {
             if name.starts_with('-') {
                 eprintln!("error: unknown option '{}'", name);
                 std::process::exit(1);
             }
-            Command::Attach { name: name.to_string(), detached: false, cmd: vec![] }
+            Command::Attach {
+                name: name.to_string(),
+                detached: false,
+                cmd: vec![],
+            }
         }
     }
 }
@@ -233,7 +305,10 @@ fn parse_args() -> Command {
 fn main() {
     let cmd = parse_args();
     let code = match cmd {
-        Command::Help => { print_help(); 0 }
+        Command::Help => {
+            print_help();
+            0
+        }
         Command::Version => {
             let dir = socket::socket_dir();
             println!("rift {}", env!("CARGO_PKG_VERSION"));
@@ -244,7 +319,12 @@ fn main() {
         Command::List { short, verbose } => commands::cmd_list(short, verbose),
         Command::Kill { names, force } => commands::cmd_kill(&names, force),
         Command::Detach { name } => commands::cmd_detach(&name),
-        Command::Run { name, cmd, detached, fish } => commands::cmd_run(&name, &cmd, detached, fish),
+        Command::Run {
+            name,
+            cmd,
+            detached,
+            fish,
+        } => commands::cmd_run(&name, &cmd, detached, fish),
         Command::Send { name, text } => commands::cmd_send(&name, &text),
         Command::Print { name, text } => commands::cmd_print(&name, &text),
         Command::Write { name, path } => commands::cmd_write(&name, &path),
@@ -252,11 +332,18 @@ fn main() {
         Command::History { name, format } => commands::cmd_history(&name, format),
         Command::Wait { names } => commands::cmd_wait(&names),
         Command::Rename { name, new_name } => commands::cmd_rename(&name, &new_name),
-        Command::Completions { shell } => { completions::print_completions(&shell); 0 }
+        Command::Completions { shell } => {
+            completions::print_completions(&shell);
+            0
+        }
         Command::Logs { name, extra } => commands::cmd_logs(&name, &extra),
         Command::Last => commands::cmd_last(),
         Command::Pick => commands::cmd_pick(),
-        Command::Attach { name, detached, cmd } => commands::cmd_attach(&name, detached, &cmd),
+        Command::Attach {
+            name,
+            detached,
+            cmd,
+        } => commands::cmd_attach(&name, detached, &cmd),
     };
     std::process::exit(code);
 }
@@ -291,4 +378,50 @@ Usage:
 
 Detach key: Ctrl+\\"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn run_options_are_parsed_before_the_session() {
+        assert_eq!(
+            parse_session_command(
+                &strings(&["-d", "--fish", "build", "cargo", "test"]),
+                true,
+                true
+            ),
+            Ok(("build".to_string(), strings(&["cargo", "test"]), true, true))
+        );
+    }
+
+    #[test]
+    fn command_flags_are_preserved_after_the_session() {
+        assert_eq!(
+            parse_session_command(
+                &strings(&["build", "cargo", "test", "--release", "-p", "rift"]),
+                true,
+                true
+            ),
+            Ok((
+                "build".to_string(),
+                strings(&["cargo", "test", "--release", "-p", "rift"]),
+                false,
+                false
+            ))
+        );
+    }
+
+    #[test]
+    fn option_separator_allows_dash_prefixed_session_name_to_reach_validation() {
+        assert_eq!(
+            parse_session_command(&strings(&["--", "-session", "command"]), true, false),
+            Ok(("-session".to_string(), strings(&["command"]), false, false))
+        );
+    }
 }

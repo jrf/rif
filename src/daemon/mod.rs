@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 
 use crate::socket;
 

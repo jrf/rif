@@ -17,7 +17,7 @@ const BASH: &str = r#"_rift_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local commands="attach new run send print write tail detach list completions kill history wait version help rename rn logs lg last la"
+  local commands="attach new run send print write tail detach list get set unset clear completions kill history wait version help rename rn logs lg last la"
 
   if [[ $COMP_CWORD -eq 1 ]]; then
     COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -25,15 +25,15 @@ const BASH: &str = r#"_rift_completions() {
   fi
 
   case "$prev" in
-    attach|a|new|n|run|r|send|s|print|p|write|wr|tail|t|kill|k|history|hi|detach|d|wait|w|rename|rn|logs|lg)
+    attach|a|new|n|run|r|send|s|print|p|write|wr|tail|t|kill|k|history|hi|detach|d|wait|w|rename|rn|logs|lg|get|g|set|unset|un|clear|cl)
       local sessions=$(rift list --short 2>/dev/null | tr '\n' ' ')
       COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
       ;;
     completions)
       COMPREPLY=($(compgen -W "bash zsh fish nu" -- "$cur"))
       ;;
-    list|ls)
-      COMPREPLY=($(compgen -W "--short --verbose" -- "$cur"))
+    list|ls|l)
+      COMPREPLY=($(compgen -W "--short --verbose --where" -- "$cur"))
       ;;
     *)
       ;;
@@ -67,6 +67,10 @@ const ZSH: &str = r#"_rift() {
         'detach:Detach all clients from a session'
         'rename:Rename a session'
         'list:List active sessions'
+        'get:Get session labels'
+        'set:Set session labels'
+        'unset:Remove session labels'
+        'clear:Clear session labels'
         'completions:Print shell completion script'
         'kill:Kill a session'
         'history:Print session output'
@@ -80,14 +84,14 @@ const ZSH: &str = r#"_rift() {
       ;;
     args)
       case $words[2] in
-        attach|a|new|n|kill|k|run|r|send|s|print|p|write|wr|tail|t|detach|d|history|hi|wait|w|rename|rn|logs|lg)
+        attach|a|new|n|kill|k|run|r|send|s|print|p|write|wr|tail|t|detach|d|history|hi|wait|w|rename|rn|logs|lg|get|g|set|unset|un|clear|cl)
           _rift_sessions
           ;;
         completions)
           _values 'shell' 'bash' 'zsh' 'fish' 'nu'
           ;;
-        list|ls)
-          _values 'options' '--short' '--verbose'
+        list|ls|l)
+          _values 'options' '--short' '--verbose' '--where'
           ;;
       esac
       ;;
@@ -122,6 +126,10 @@ complete -c rift -n "__fish_is_nth_token 1" -a 't tail' -d 'Follow session outpu
 complete -c rift -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients from a session'
 complete -c rift -n "__fish_is_nth_token 1" -a 'rn rename' -d 'Rename a session'
 complete -c rift -n "__fish_is_nth_token 1" -a 'l ls list' -d 'List active sessions'
+complete -c rift -n "__fish_is_nth_token 1" -a 'g get' -d 'Get session labels'
+complete -c rift -n "__fish_is_nth_token 1" -a 'set' -d 'Set session labels'
+complete -c rift -n "__fish_is_nth_token 1" -a 'un unset' -d 'Remove session labels'
+complete -c rift -n "__fish_is_nth_token 1" -a 'cl clear' -d 'Clear session labels'
 complete -c rift -n "__fish_is_nth_token 1" -a 'c completions' -d 'Print shell completion script'
 complete -c rift -n "__fish_is_nth_token 1" -a 'k kill' -d 'Kill a session'
 complete -c rift -n "__fish_is_nth_token 1" -a 'hi history' -d 'Print session output'
@@ -133,12 +141,13 @@ complete -c rift -s V -l version -d 'Print version'
 complete -c rift -n "__fish_is_nth_token 1" -a 'h help' -d 'Print help'
 complete -c rift -s h -d 'Print help'
 
-complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr tail t kill k detach d history hi wait w rename rn logs lg" -a '(rift list --short 2>/dev/null)' -d 'Session name'
+complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr tail t kill k detach d history hi wait w rename rn logs lg get g set unset un clear cl" -a '(rift list --short 2>/dev/null)' -d 'Session name'
 
 complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from completions c" -a 'bash zsh fish nu' -d Shell
 
 complete -c rift -n "__fish_seen_subcommand_from list ls l" -l short -s s -d 'Short output'
 complete -c rift -n "__fish_seen_subcommand_from list ls l" -l verbose -s v -d 'Verbose output (uptime, log path)'
+complete -c rift -n "__fish_seen_subcommand_from list ls l" -l where -r -d 'Filter by label (key=value)'
 complete -c rift -n "__fish_seen_subcommand_from history hi" -l vt -d 'VT escape sequence format'
 complete -c rift -n "__fish_seen_subcommand_from history hi" -l html -d 'HTML format'
 complete -c rift -n "__fish_seen_subcommand_from attach a" -s d -l detached -d 'Create without attaching'
@@ -194,7 +203,11 @@ export extern "rift kill" [
 ]
 
 export extern "rift detach" [name?: string@"nu-complete rift sessions"]
-export extern "rift list" [--short(-s), --verbose(-v)]
+export extern "rift list" [--short(-s), --verbose(-v), --where: string]
+export extern "rift get" [name: string@"nu-complete rift sessions", key?: string]
+export extern "rift set" [name: string@"nu-complete rift sessions", ...labels: string]
+export extern "rift unset" [name: string@"nu-complete rift sessions", ...keys: string]
+export extern "rift clear" [name: string@"nu-complete rift sessions"]
 export extern "rift history" [name: string@"nu-complete rift sessions", --vt, --html]
 export extern "rift wait" [...names: string@"nu-complete rift sessions"]
 export extern "rift tail" [...names: string@"nu-complete rift sessions"]

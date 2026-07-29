@@ -2,6 +2,7 @@ mod commands;
 mod completions;
 mod daemon;
 mod ipc;
+mod label;
 mod logger;
 mod socket;
 mod util;
@@ -22,6 +23,22 @@ enum Command {
     List {
         short: bool,
         verbose: bool,
+        where_pair: Option<String>,
+    },
+    LabelGet {
+        name: String,
+        key: Option<String>,
+    },
+    LabelSet {
+        name: String,
+        pairs: Vec<String>,
+    },
+    LabelUnset {
+        name: String,
+        keys: Vec<String>,
+    },
+    LabelClear {
+        name: String,
     },
     Run {
         name: String,
@@ -120,7 +137,57 @@ fn parse_args() -> Command {
         "list" | "ls" | "l" => {
             let short = args.iter().any(|a| a == "-s" || a == "--short");
             let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
-            Command::List { short, verbose }
+            let where_pair = args
+                .iter()
+                .position(|arg| arg == "--where")
+                .and_then(|index| args.get(index + 1))
+                .cloned();
+            if args.iter().any(|arg| arg == "--where") && where_pair.is_none() {
+                eprintln!("error: list --where requires key=value");
+                std::process::exit(1);
+            }
+            Command::List {
+                short,
+                verbose,
+                where_pair,
+            }
+        }
+        "get" | "g" => {
+            let Some(name) = args.get(1) else {
+                eprintln!("error: get requires a session name");
+                std::process::exit(1);
+            };
+            Command::LabelGet {
+                name: name.clone(),
+                key: args.get(2).cloned(),
+            }
+        }
+        "set" => {
+            let Some(name) = args.get(1) else {
+                eprintln!("error: set requires a session name");
+                std::process::exit(1);
+            };
+            Command::LabelSet {
+                name: name.clone(),
+                pairs: args[2..].to_vec(),
+            }
+        }
+        "unset" | "un" => {
+            let Some(name) = args.get(1) else {
+                eprintln!("error: unset requires a session name");
+                std::process::exit(1);
+            };
+            Command::LabelUnset {
+                name: name.clone(),
+                keys: args[2..].to_vec(),
+            }
+        }
+        "clear" | "cl" => {
+            let Some(name) = args.get(1) else {
+                eprintln!("error: clear requires a session name");
+                std::process::exit(1);
+            };
+            Command::LabelClear { name: name.clone() }
         }
         "kill" | "k" => {
             if args.len() < 2 {
@@ -316,7 +383,15 @@ fn main() {
             println!("log dir:    {}", dir.join("logs").display());
             0
         }
-        Command::List { short, verbose } => commands::cmd_list(short, verbose),
+        Command::List {
+            short,
+            verbose,
+            where_pair,
+        } => commands::cmd_list(short, verbose, where_pair.as_deref()),
+        Command::LabelGet { name, key } => commands::cmd_label_get(&name, key.as_deref()),
+        Command::LabelSet { name, pairs } => commands::cmd_label_set(&name, &pairs),
+        Command::LabelUnset { name, keys } => commands::cmd_label_unset(&name, &keys),
+        Command::LabelClear { name } => commands::cmd_label_clear(&name),
         Command::Kill { names, force } => commands::cmd_kill(&names, force),
         Command::Detach { name } => commands::cmd_detach(&name),
         Command::Run {
@@ -359,7 +434,12 @@ Usage:
   rift attach|a <session>       Same as above (optional <cmd> to run instead of shell)
   rift attach -d <session>      Create session without attaching
   rift new|n <session>          Same as attach -d
-  rift list|ls|l [-s|-v]        List sessions (-s short, -v verbose: uptime + log path)
+  rift list|ls|l [-s|-v] [--where k=v]
+                                List sessions, optionally filtered by label
+  rift get|g <session> [key]    Get all labels or one label value
+  rift set <session> k=v...     Set labels (empty value removes a label)
+  rift unset|un <session> key... Remove labels
+  rift clear|cl <session>       Clear all labels
   rift run|r <session> <cmd...> Run a command in a session (-d, --fish)
   rift send|s <session> <text>  Send keystrokes to a session
   rift print|p <session> <text> Inject text into session display

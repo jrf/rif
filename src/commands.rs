@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, IsTerminal, Read};
 use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,6 +8,7 @@ use nix::sys::signal::Signal;
 
 use crate::daemon::{self, Cfg};
 use crate::ipc::{self, SocketBuffer, Tag};
+use crate::label;
 use crate::socket;
 use crate::util;
 
@@ -23,7 +24,14 @@ fn next_request_id() -> u64 {
 // list
 // ---------------------------------------------------------------------------
 
-pub fn cmd_list(short: bool, verbose: bool) -> i32 {
+pub fn cmd_list(short: bool, verbose: bool, where_pair: Option<&str>) -> i32 {
+    let filter = match where_pair.map(label::parse_pair).transpose() {
+        Ok(filter) => filter,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
     let socket_dir = socket::socket_dir();
     let current = socket::session_name_from_env();
     let current_ref = if current.is_empty() {
@@ -36,7 +44,17 @@ pub fn cmd_list(short: bool, verbose: bool) -> i32 {
         Ok(entries) => {
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            for entry in &entries {
+            for entry in entries.iter().filter(|entry| {
+                let Some((key, expected)) = filter else {
+                    return true;
+                };
+                entry
+                    .labels
+                    .as_deref()
+                    .map(label::decode)
+                    .and_then(|labels| labels.get(key).cloned())
+                    .is_some_and(|value| value == expected)
+            }) {
                 let _ = util::write_session_line(
                     &mut out,
                     entry,
@@ -55,6 +73,112 @@ pub fn cmd_list(short: bool, verbose: bool) -> i32 {
                 eprintln!("error: {}", e);
                 1
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// labels
+// ---------------------------------------------------------------------------
+
+fn label_request(
+    name: &str,
+    request_tag: Tag,
+    payload: &[u8],
+    response_tag: Tag,
+) -> Result<Vec<u8>, String> {
+    let cfg = Cfg::resolve(name)?;
+    let socket_path = cfg.socket_path.to_str().ok_or("invalid socket path")?;
+    ipc::request_response(socket_path, request_tag, payload, response_tag).map_err(|error| {
+        if matches!(error, ipc::ProbeError::Timeout) {
+            format!(
+                "session '{}' did not respond to the label request; restart its daemon with this Rift version",
+                cfg.session_name
+            )
+        } else {
+            format!("label request for '{}': {}", cfg.session_name, error)
+        }
+    })
+}
+
+pub fn cmd_label_get(name: &str, key: Option<&str>) -> i32 {
+    if let Some(key) = key
+        && let Err(error) = label::validate_key(key)
+    {
+        eprintln!("error: {error}");
+        return 1;
+    }
+    let payload = match label_request(name, Tag::LabelGet, &[], Tag::LabelData) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    let labels = String::from_utf8_lossy(&payload);
+    if let Some(key) = key {
+        match label::decode(&labels).get(key) {
+            Some(value) => print!("{value}"),
+            None => {
+                eprintln!("error: label key not found: {key}");
+                return 1;
+            }
+        }
+    } else {
+        print!("{labels}");
+    }
+    0
+}
+
+pub fn cmd_label_set(name: &str, pairs: &[String]) -> i32 {
+    if pairs.is_empty() {
+        eprintln!("error: set requires at least one key=value label");
+        return 1;
+    }
+    for pair in pairs {
+        if let Err(error) = label::parse_pair(pair) {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    }
+    let payload = pairs.join(" ");
+    match label_request(name, Tag::LabelSet, payload.as_bytes(), Tag::Ack) {
+        Ok(_) => 0,
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
+        }
+    }
+}
+
+pub fn cmd_label_unset(name: &str, keys: &[String]) -> i32 {
+    if keys.is_empty() {
+        eprintln!("error: unset requires at least one label key");
+        return 1;
+    }
+    let mut pairs = Vec::with_capacity(keys.len());
+    for key in keys {
+        if let Err(error) = label::validate_key(key) {
+            eprintln!("error: {error}");
+            return 1;
+        }
+        pairs.push(format!("{key}="));
+    }
+    match label_request(name, Tag::LabelSet, pairs.join(" ").as_bytes(), Tag::Ack) {
+        Ok(_) => 0,
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
+        }
+    }
+}
+
+pub fn cmd_label_clear(name: &str) -> i32 {
+    match label_request(name, Tag::LabelClear, &[], Tag::Ack) {
+        Ok(_) => 0,
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
         }
     }
 }
@@ -186,52 +310,76 @@ pub fn cmd_detach(name: &str) -> i32 {
 // ---------------------------------------------------------------------------
 
 pub fn cmd_history(name: &str, format: util::HistoryFormat) -> i32 {
-    let fd = match util::session_connect_by_name(name) {
-        Ok(fd) => fd,
-        Err(e) => {
-            eprintln!("error: {}", e);
+    let data = match fetch_history(name, format) {
+        Ok(data) => data,
+        Err(error) => {
+            eprintln!("error: {}", error);
             return 1;
         }
     };
+    if !data.is_empty() {
+        let _ = ipc::write_all(1, &data);
+    }
+    0
+}
+
+fn fetch_history(name: &str, format: util::HistoryFormat) -> Result<Vec<u8>, String> {
+    let fd = util::session_connect_by_name(name).map_err(|error| error.to_string())?;
 
     let format_byte = format as u8;
-    if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::History, &[format_byte]) {
-        eprintln!("error: failed to send history request: {}", e);
-        return 1;
-    }
+    ipc::send(fd.as_raw_fd(), Tag::History, &[format_byte])
+        .map_err(|error| format!("failed to send history request: {}", error))?;
 
     daemon::ignore_signal(Signal::SIGPIPE);
     let mut socket_buf = SocketBuffer::new();
-    let stdout_fd: RawFd = 1;
 
     loop {
         let sock_bfd = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
         let mut poll_fds = [PollFd::new(sock_bfd, PollFlags::POLLIN)];
 
         match poll(&mut poll_fds, PollTimeout::from(5000u16)) {
-            Ok(0) => break,
+            Ok(0) => return Err("timed out waiting for history".to_string()),
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
-            Err(_) => break,
+            Err(error) => return Err(format!("failed waiting for history: {}", error)),
         }
 
         match socket_buf.read(fd.as_raw_fd()) {
-            Ok(0) => break,
+            Ok(0) => return Err("session closed before returning history".to_string()),
             Ok(_) => {
                 while let Some((tag, payload)) = socket_buf.next() {
                     if tag == Tag::History {
-                        if !payload.is_empty() {
-                            let _ = ipc::write_all(stdout_fd, payload);
-                        }
-                        return 0;
+                        return Ok(payload.to_vec());
                     }
                 }
             }
-            Err(_) => break,
+            Err(nix::errno::Errno::EAGAIN) => {}
+            Err(error) => return Err(format!("failed reading history: {}", error)),
         }
     }
+}
 
-    0
+fn report_failed_task(session: &util::SessionEntry) {
+    let exit_code = session.task_exit_code.unwrap_or(1);
+    eprintln!("failed task={} exit_status={}", session.name, exit_code);
+
+    match fetch_history(&session.name, util::HistoryFormat::Plain) {
+        Ok(history) => {
+            let text = String::from_utf8_lossy(&history);
+            let lines: Vec<&str> = text.lines().collect();
+            let start = lines.len().saturating_sub(20);
+            eprintln!(
+                "last {} lines of {} history:",
+                lines.len() - start,
+                session.name
+            );
+            for line in &lines[start..] {
+                eprintln!("{}", line);
+            }
+        }
+        Err(error) => eprintln!("history unavailable for {}: {}", session.name, error),
+    }
+    eprintln!("inspect with: rift history {}", session.name);
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +401,7 @@ pub fn cmd_wait(names: &[String]) -> i32 {
     };
 
     let mut no_match_count = 0;
+    let mut max_seen = 0;
     let mut last_exit_code: i32 = 0;
 
     loop {
@@ -273,6 +422,14 @@ pub fn cmd_wait(names: &[String]) -> i32 {
             .filter(|e| util::pattern_matches(&patterns, &e.name))
             .collect();
 
+        if matching.len() < max_seen {
+            eprintln!(
+                "error: {} session(s) disappeared before completing",
+                max_seen - matching.len()
+            );
+            return 1;
+        }
+
         if matching.is_empty() {
             no_match_count += 1;
             if no_match_count >= 3 {
@@ -283,6 +440,7 @@ pub fn cmd_wait(names: &[String]) -> i32 {
             continue;
         }
         no_match_count = 0;
+        max_seen = max_seen.max(matching.len());
 
         let mut all_done = true;
         let mut any_unreachable = false;
@@ -314,7 +472,16 @@ pub fn cmd_wait(names: &[String]) -> i32 {
         }
 
         if all_done {
-            eprintln!("tasks completed!");
+            if last_exit_code == 0 {
+                eprintln!("tasks completed!");
+            } else {
+                eprintln!("tasks failed!");
+                for session in matching {
+                    if session.task_exit_code.unwrap_or(0) != 0 {
+                        report_failed_task(session);
+                    }
+                }
+            }
             return last_exit_code;
         }
 
@@ -326,11 +493,46 @@ pub fn cmd_wait(names: &[String]) -> i32 {
 // run
 // ---------------------------------------------------------------------------
 
-pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i32 {
-    if cmd_args.is_empty() {
-        eprintln!("error: run requires a command");
-        return 1;
+fn run_command(cmd_args: &[String]) -> Result<String, String> {
+    if !cmd_args.is_empty() {
+        return Ok(cmd_args
+            .iter()
+            .map(|arg| {
+                if util::shell_needs_quoting(arg) {
+                    util::shell_quote(arg)
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "));
     }
+
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        return Err("run requires a command or piped stdin".to_string());
+    }
+
+    let mut command = String::new();
+    stdin
+        .lock()
+        .read_to_string(&mut command)
+        .map_err(|error| format!("failed to read stdin: {}", error))?;
+    if command.is_empty() {
+        Err("run requires a command or non-empty stdin".to_string())
+    } else {
+        Ok(command)
+    }
+}
+
+pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i32 {
+    let cmd_str = match run_command(cmd_args) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("error: {}", error);
+            return 1;
+        }
+    };
 
     let cfg = match Cfg::resolve(name) {
         Ok(c) => c,
@@ -380,27 +582,15 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
         }
     };
 
-    let cmd_str: String = cmd_args
-        .iter()
-        .map(|a| {
-            if util::shell_needs_quoting(a) {
-                util::shell_quote(a)
-            } else {
-                a.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-
     let request_id = next_request_id();
     let wrapped = if fish {
         format!(
-            "{}; set __rift_status $status; printf '\\nRIFT_TASK_REQUEST_COMPLETED:{}:%d\\n' $__rift_status; printf 'RIFT_TASK_%s:%d\\n' COMPLETED $__rift_status\n",
+            "{}\nset __rift_status $status; printf '\\nRIFT_TASK_REQUEST_COMPLETED:{}:%d\\n' $__rift_status; printf 'RIFT_TASK_%s:%d\\n' COMPLETED $__rift_status\n",
             cmd_str, request_id
         )
     } else {
         format!(
-            "{}; __rift_status=$?; printf '\\nRIFT_TASK_REQUEST_COMPLETED:{}:%d\\n' \"$__rift_status\"; printf 'RIFT_TASK_%s:%d\\n' COMPLETED \"$__rift_status\"\n",
+            "{}\n__rift_status=$?; printf '\\nRIFT_TASK_REQUEST_COMPLETED:{}:%d\\n' \"$__rift_status\"; printf 'RIFT_TASK_%s:%d\\n' COMPLETED \"$__rift_status\"\n",
             cmd_str, request_id
         )
     };

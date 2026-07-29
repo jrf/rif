@@ -1,7 +1,7 @@
 //! Daemon-process side: owns the PTY, accepts client connections, drives
 //! the vt100 parser, and brokers per-client tasks via mpsc channels.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,6 +18,7 @@ use tokio::time::{self, Duration, Instant};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::ipc::{self, RiftCodec, Tag};
+use crate::label;
 use crate::socket;
 use crate::util;
 
@@ -95,6 +96,7 @@ fn drain_da_queries(master_fd: RawFd) -> Vec<u8> {
 fn spawn_pty(
     cmd: &str,
     args: &[&str],
+    login_shell: bool,
     rows: u16,
     cols: u16,
     session_name: &str,
@@ -133,7 +135,7 @@ fn spawn_pty(
 
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
 
-            if args.is_empty() {
+            if login_shell {
                 let shell_cstr = std::ffi::CString::new(cmd).unwrap();
                 let login_name = format!("-{}", cmd.rsplit('/').next().unwrap_or(cmd));
                 let login_cstr = std::ffi::CString::new(login_name).unwrap();
@@ -152,7 +154,7 @@ fn spawn_pty(
                 let mut argv_ptrs: Vec<*const libc::c_char> =
                     argv.iter().map(|a| a.as_ptr()).collect();
                 argv_ptrs.push(std::ptr::null());
-                libc::execv(cmd_cstr.as_ptr(), argv_ptrs.as_ptr());
+                libc::execvp(cmd_cstr.as_ptr(), argv_ptrs.as_ptr());
             }
 
             libc::_exit(127);
@@ -184,6 +186,28 @@ struct DaemonFrame {
     payload: Bytes,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputAction {
+    Drop,
+    Forward,
+    TakeLeadership,
+}
+
+fn input_action(
+    leader_client_id: Option<u64>,
+    client_id: u64,
+    interactive: bool,
+    payload: &[u8],
+) -> InputAction {
+    if leader_client_id == Some(client_id) || !interactive {
+        InputAction::Forward
+    } else if util::is_user_input(payload) {
+        InputAction::TakeLeadership
+    } else {
+        InputAction::Drop
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DaemonState — owned exclusively by the main task
 // ---------------------------------------------------------------------------
@@ -205,6 +229,9 @@ struct DaemonState {
     child_exited: bool,
     has_had_client: bool,
     clients: HashMap<u64, mpsc::Sender<DaemonFrame>>,
+    client_sizes: HashMap<u64, ipc::Resize>,
+    leader_client_id: Option<u64>,
+    labels: BTreeMap<String, String>,
     pending_runs: HashMap<u64, u64>,
     task_scan_carry: Vec<u8>,
     next_client_id: u64,
@@ -230,8 +257,14 @@ impl DaemonState {
     /// Send a frame to every connected client. Drops clients whose channels
     /// are full (slow reader, exceeded backpressure budget) or closed.
     fn broadcast(&mut self, frame: DaemonFrame) {
-        self.clients
-            .retain(|_id, tx| tx.try_send(frame.clone()).is_ok());
+        let dropped: Vec<u64> = self
+            .clients
+            .iter()
+            .filter_map(|(id, tx)| tx.try_send(frame.clone()).is_err().then_some(*id))
+            .collect();
+        for id in dropped {
+            self.remove_client(id);
+        }
     }
 
     /// Send a frame to a specific client. Drops the client on failure.
@@ -241,7 +274,40 @@ impl DaemonState {
             None => false,
         };
         if drop_it {
-            self.clients.remove(&id);
+            self.remove_client(id);
+        }
+    }
+
+    fn remove_client(&mut self, id: u64) -> bool {
+        self.client_sizes.remove(&id);
+        if self.leader_client_id == Some(id) {
+            self.leader_client_id = None;
+            log::info!("interactive leader disconnected, id={}", id);
+        }
+        self.clients.remove(&id).is_some()
+    }
+
+    fn apply_resize(&mut self, resize: ipc::Resize) {
+        self.parser.screen_mut().set_size(resize.rows, resize.cols);
+        let ws = libc::winsize {
+            ws_row: resize.rows,
+            ws_col: resize.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe {
+            libc::ioctl(self.pty_master_fd, libc::TIOCSWINSZ, &ws);
+        }
+    }
+
+    fn set_leader(&mut self, id: u64) {
+        if self.leader_client_id == Some(id) {
+            return;
+        }
+        self.leader_client_id = Some(id);
+        log::info!("interactive leader changed, id={}", id);
+        if let Some(resize) = self.client_sizes.get(&id).copied() {
+            self.apply_resize(resize);
         }
     }
 
@@ -289,9 +355,11 @@ impl DaemonState {
                 );
             }
         }
+        let rewritten = util::rewrite_prompt_redraw(data);
+        let output = rewritten.as_deref().unwrap_or(data);
         self.broadcast(DaemonFrame {
             tag: Tag::Output,
-            payload: Bytes::copy_from_slice(data),
+            payload: Bytes::copy_from_slice(output),
         });
         self.clients.is_empty()
     }
@@ -310,9 +378,12 @@ impl DaemonState {
         let (tx, rx) = mpsc::channel(CLIENT_TX_BUF);
 
         let initial = if self.has_had_client {
-            util::serialize_terminal_state(&self.parser).map(|s| DaemonFrame {
-                tag: Tag::Init,
-                payload: Bytes::from(s),
+            util::serialize_terminal_state(&self.parser).map(|state| {
+                let state = util::rewrite_prompt_redraw(&state).unwrap_or(state);
+                DaemonFrame {
+                    tag: Tag::Init,
+                    payload: Bytes::from(state),
+                }
             })
         } else {
             None
@@ -394,19 +465,25 @@ impl DaemonState {
     fn handle_client_frame(&mut self, id: u64, tag: Tag, payload: Vec<u8>) {
         match tag {
             Tag::Input => {
-                let _ = ipc::write_all(self.pty_master_fd, &payload);
+                let interactive = self.client_sizes.contains_key(&id);
+                match input_action(self.leader_client_id, id, interactive, &payload) {
+                    InputAction::Drop => {}
+                    InputAction::Forward => {
+                        let _ = ipc::write_all(self.pty_master_fd, &payload);
+                    }
+                    InputAction::TakeLeadership => {
+                        self.set_leader(id);
+                        let _ = ipc::write_all(self.pty_master_fd, &payload);
+                    }
+                }
             }
             Tag::Resize => {
                 if let Some(r) = ipc::Resize::decode(&payload) {
-                    self.parser.screen_mut().set_size(r.rows, r.cols);
-                    let ws = libc::winsize {
-                        ws_row: r.rows,
-                        ws_col: r.cols,
-                        ws_xpixel: 0,
-                        ws_ypixel: 0,
-                    };
-                    unsafe {
-                        libc::ioctl(self.pty_master_fd, libc::TIOCSWINSZ, &ws);
+                    self.client_sizes.insert(id, r);
+                    if self.leader_client_id.is_none() {
+                        self.set_leader(id);
+                    } else if self.leader_client_id == Some(id) {
+                        self.apply_resize(r);
                     }
                 }
             }
@@ -419,7 +496,7 @@ impl DaemonState {
                         payload: Bytes::new(),
                     },
                 );
-                self.clients.remove(&id);
+                self.remove_client(id);
             }
             Tag::DetachAll => {
                 log::info!("client requested detach-all");
@@ -428,6 +505,8 @@ impl DaemonState {
                     payload: Bytes::new(),
                 });
                 self.clients.clear();
+                self.client_sizes.clear();
+                self.leader_client_id = None;
             }
             Tag::Kill => {
                 log::info!("kill requested");
@@ -442,6 +521,46 @@ impl DaemonState {
                     DaemonFrame {
                         tag: Tag::Info,
                         payload,
+                    },
+                );
+            }
+            Tag::LabelGet => {
+                self.send_to(
+                    id,
+                    DaemonFrame {
+                        tag: Tag::LabelData,
+                        payload: Bytes::from(label::encode(&self.labels)),
+                    },
+                );
+            }
+            Tag::LabelSet => {
+                if let Ok(pairs) = std::str::from_utf8(&payload) {
+                    for pair in pairs.split_whitespace() {
+                        let Ok((key, value)) = label::parse_pair(pair) else {
+                            continue;
+                        };
+                        if value.is_empty() {
+                            self.labels.remove(key);
+                        } else {
+                            self.labels.insert(key.to_string(), value.to_string());
+                        }
+                    }
+                }
+                self.send_to(
+                    id,
+                    DaemonFrame {
+                        tag: Tag::Ack,
+                        payload: Bytes::new(),
+                    },
+                );
+            }
+            Tag::LabelClear => {
+                self.labels.clear();
+                self.send_to(
+                    id,
+                    DaemonFrame {
+                        tag: Tag::Ack,
+                        payload: Bytes::new(),
                     },
                 );
             }
@@ -635,7 +754,7 @@ async fn daemon_main(mut state: DaemonState, listener: UnixListener, pty_master:
                         state.handle_client_frame(id, tag, payload);
                     }
                     ClientMsg::Gone => {
-                        if state.clients.remove(&id).is_some() {
+                        if state.remove_client(id) {
                             log::info!("client disconnected, id={}", id);
                         }
                     }
@@ -777,8 +896,14 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
     } else {
         cmd[1..].iter().map(|s| s.as_str()).collect()
     };
-    let (master_fd, child_pid) = match spawn_pty(spawn_cmd, &spawn_args, 24, 80, &cfg.session_name)
-    {
+    let (master_fd, child_pid) = match spawn_pty(
+        spawn_cmd,
+        &spawn_args,
+        cmd.is_empty(),
+        24,
+        80,
+        &cfg.session_name,
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: failed to spawn pty: {}", e);
@@ -831,6 +956,9 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
         child_exited: false,
         has_had_client: false,
         clients: HashMap::new(),
+        client_sizes: HashMap::new(),
+        leader_client_id: None,
+        labels: BTreeMap::new(),
         pending_runs: HashMap::new(),
         task_scan_carry: Vec::new(),
         next_client_id: 0,
@@ -929,4 +1057,33 @@ pub fn spawn_daemon_detached(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
     fork_daemon(cfg, cmd)?;
     println!("session '{}' created", cfg.session_name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noninteractive_input_does_not_take_leadership() {
+        assert_eq!(
+            input_action(Some(1), 2, false, b"automated input"),
+            InputAction::Forward
+        );
+    }
+
+    #[test]
+    fn interactive_keyboard_input_takes_leadership() {
+        assert_eq!(
+            input_action(Some(1), 2, true, b"\x1b[102;1:1u"),
+            InputAction::TakeLeadership
+        );
+    }
+
+    #[test]
+    fn interactive_terminal_response_does_not_take_leadership() {
+        assert_eq!(
+            input_action(Some(1), 2, true, b"\x1b[?1;2c"),
+            InputAction::Drop
+        );
+    }
 }

@@ -26,6 +26,11 @@ pub enum Tag {
     Print = 14,
     SshAuthSock = 15,
     Rename = 16,
+    Ack = 17,
+    LabelGet = 18,
+    LabelSet = 19,
+    LabelClear = 20,
+    LabelData = 21,
 }
 
 impl Tag {
@@ -45,6 +50,11 @@ impl Tag {
             14 => Some(Tag::Print),
             15 => Some(Tag::SshAuthSock),
             16 => Some(Tag::Rename),
+            17 => Some(Tag::Ack),
+            18 => Some(Tag::LabelGet),
+            19 => Some(Tag::LabelSet),
+            20 => Some(Tag::LabelClear),
+            21 => Some(Tag::LabelData),
             _ => None,
         }
     }
@@ -278,6 +288,7 @@ impl SocketBuffer {
     }
 }
 
+#[derive(Debug)]
 pub enum ProbeError {
     Timeout,
     ConnectionRefused,
@@ -297,6 +308,7 @@ impl std::fmt::Display for ProbeError {
 pub struct ProbeResult {
     pub fd: OwnedFd,
     pub info: Info,
+    pub labels: Option<Vec<u8>>,
 }
 
 pub fn probe_session(socket_path: &str) -> Result<ProbeResult, ProbeError> {
@@ -309,14 +321,29 @@ pub fn probe_session(socket_path: &str) -> Result<ProbeResult, ProbeError> {
     })?;
 
     send(fd.as_raw_fd(), Tag::Info, &[]).map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
+    send(fd.as_raw_fd(), Tag::LabelGet, &[])
+        .map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
 
     let mut sb = SocketBuffer::new();
     let deadline = Instant::now() + Duration::from_millis(2000);
+    let mut info = None;
+    let mut labels = None;
+    let mut labels_deadline = None;
 
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        if labels.is_some()
+            && let Some(info) = info
+        {
+            return Ok(ProbeResult { fd, info, labels });
+        }
+
+        let active_deadline = labels_deadline.unwrap_or(deadline);
+        let remaining = active_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(ProbeError::Timeout);
+            return match info {
+                Some(info) => Ok(ProbeResult { fd, info, labels }),
+                None => Err(ProbeError::Timeout),
+            };
         }
         let timeout_ms = (remaining.as_millis() as u64).min(u16::MAX as u64) as u16;
 
@@ -325,21 +352,77 @@ pub fn probe_session(socket_path: &str) -> Result<ProbeResult, ProbeError> {
         let r = poll(&mut poll_fds, PollTimeout::from(timeout_ms))
             .map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
         if r == 0 {
-            return Err(ProbeError::Timeout);
+            return match info {
+                Some(info) => Ok(ProbeResult { fd, info, labels }),
+                None => Err(ProbeError::Timeout),
+            };
         }
 
         let n = sb
             .read(fd.as_raw_fd())
             .map_err(|e| ProbeError::Unexpected(format!("{}", e)))?;
         if n == 0 {
-            return Err(ProbeError::Unexpected("connection closed".into()));
+            return match info {
+                Some(info) => Ok(ProbeResult { fd, info, labels }),
+                None => Err(ProbeError::Unexpected("connection closed".into())),
+            };
         }
 
         while let Some((tag, payload)) = sb.next() {
-            if tag == Tag::Info
-                && let Some(info) = Info::decode(payload)
-            {
-                return Ok(ProbeResult { fd, info });
+            match tag {
+                Tag::Info => {
+                    info = Info::decode(payload);
+                    if info.is_some() && labels_deadline.is_none() {
+                        labels_deadline = Some(Instant::now() + Duration::from_millis(50));
+                    }
+                }
+                Tag::LabelData => labels = Some(payload.to_vec()),
+                _ => {}
+            }
+        }
+    }
+}
+
+pub fn request_response(
+    socket_path: &str,
+    request_tag: Tag,
+    payload: &[u8],
+    response_tag: Tag,
+) -> Result<Vec<u8>, ProbeError> {
+    let fd = socket::session_connect(socket_path).map_err(|error| {
+        if error.kind() == io::ErrorKind::ConnectionRefused {
+            ProbeError::ConnectionRefused
+        } else {
+            ProbeError::Unexpected(error.to_string())
+        }
+    })?;
+    send(fd.as_raw_fd(), request_tag, payload)
+        .map_err(|error| ProbeError::Unexpected(error.to_string()))?;
+
+    let mut buffer = SocketBuffer::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ProbeError::Timeout);
+        }
+        let timeout_ms = (remaining.as_millis() as u64).min(u16::MAX as u64) as u16;
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
+        let mut poll_fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+        let ready = poll(&mut poll_fds, PollTimeout::from(timeout_ms))
+            .map_err(|error| ProbeError::Unexpected(error.to_string()))?;
+        if ready == 0 {
+            return Err(ProbeError::Timeout);
+        }
+        let read = buffer
+            .read(fd.as_raw_fd())
+            .map_err(|error| ProbeError::Unexpected(error.to_string()))?;
+        if read == 0 {
+            return Err(ProbeError::Unexpected("connection closed".into()));
+        }
+        while let Some((tag, response)) = buffer.next() {
+            if tag == response_tag {
+                return Ok(response.to_vec());
             }
         }
     }
@@ -403,6 +486,84 @@ impl Encoder<(Tag, Bytes)> for RiftCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_tag_values_and_info_header_are_frozen() {
+        let tags = [
+            (Tag::Input, 0),
+            (Tag::Output, 1),
+            (Tag::Resize, 2),
+            (Tag::Detach, 3),
+            (Tag::DetachAll, 4),
+            (Tag::Kill, 5),
+            (Tag::Info, 6),
+            (Tag::Init, 7),
+            (Tag::History, 8),
+            (Tag::Run, 9),
+            (Tag::TaskComplete, 10),
+            (Tag::Print, 14),
+            (Tag::SshAuthSock, 15),
+            (Tag::Rename, 16),
+            (Tag::Ack, 17),
+            (Tag::LabelGet, 18),
+            (Tag::LabelSet, 19),
+            (Tag::LabelClear, 20),
+            (Tag::LabelData, 21),
+        ];
+        for (tag, expected) in tags {
+            assert_eq!(tag as u8, expected);
+            assert_eq!(Tag::from_u8(expected), Some(tag));
+        }
+        assert_eq!(Info::default().encode().len(), Info::HEADER_LEN);
+    }
+
+    #[test]
+    fn probe_keeps_old_daemons_without_label_support_listable() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let socket_path = std::env::temp_dir().join(format!(
+            "rift-old-daemon-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept probe");
+            let mut tags = Vec::new();
+            for _ in 0..2 {
+                let mut header = [0; HEADER_SIZE];
+                stream.read_exact(&mut header).expect("read request header");
+                let length = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
+                let mut payload = vec![0; length];
+                stream.read_exact(&mut payload).expect("read request body");
+                tags.push(header[0]);
+            }
+            let payload = Info {
+                pid: 123,
+                ..Info::default()
+            }
+            .encode();
+            stream
+                .write_all(&encode_header(Tag::Info, payload.len() as u32))
+                .expect("write response header");
+            stream.write_all(&payload).expect("write response body");
+            std::thread::sleep(Duration::from_millis(100));
+            tags
+        });
+
+        let result = probe_session(socket_path.to_str().unwrap()).expect("probe old daemon");
+        assert_eq!(result.info.pid, 123);
+        assert_eq!(result.labels, None);
+        assert_eq!(
+            server.join().expect("join server"),
+            vec![Tag::Info as u8, Tag::LabelGet as u8]
+        );
+        std::fs::remove_file(socket_path).expect("remove test socket");
+    }
 
     #[test]
     fn info_round_trips() {

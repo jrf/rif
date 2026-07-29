@@ -25,8 +25,12 @@ rift <session>                Attach to (or create) a session
 rift attach <session>         Same as above
 rift attach -d <session>      Create session without attaching
 rift new <session>            Same as attach -d
-rift list [-s|-v]             List sessions (-s short/scriptable, -v verbose: uptime + log path)
-rift run <session> <cmd...>   Run a command in a session (-d for detached, --fish)
+rift list [-s|-v] [--where k=v] List sessions, optionally filtered by label
+rift get <session> [key]      Get all labels or one label value
+rift set <session> k=v...     Set session labels
+rift unset <session> key...   Remove session labels
+rift clear <session>          Clear all session labels
+rift run <session> [<cmd...>] Run a command or piped script (-d for detached, --fish)
 rift send <session> <text>    Send keystrokes to a session
 rift print <session> <text>   Inject text into session display
 rift write <session> <path>   Write stdin to a file via the session
@@ -58,6 +62,9 @@ rift dev
 rift run -d build make -j8
 rift wait build
 
+# Run a multiline script from stdin
+printf 'cargo fmt\ncargo test\n' | rift run checks
+
 # Send keystrokes to a running session
 rift send dev "ls -la" $'\n'
 
@@ -66,6 +73,10 @@ rift tail 'dev*'
 
 # List active sessions
 rift list
+
+# Label sessions and filter the list
+rift set dev project=rift env=dev
+rift list --where project=rift
 ```
 
 ## Environment Variables
@@ -101,6 +112,10 @@ When the session is spawned, `rift` configures the shell's `SSH_AUTH_SOCK` to po
 
 The daemon forks on first attach, creates a PTY, and spawns a shell. Both daemon and client run on a single-threaded tokio runtime (`current_thread` + `LocalSet`). The daemon's main task multiplexes the listening socket, PTY master (`AsyncFd<OwnedFd>`), and `SIGCHLD`/`SIGTERM` via `tokio::select!`; each accepted client is its own task that talks back through an mpsc channel. Terminal state is tracked via a vt100 parser and replayed to reattaching clients.
 
+When multiple interactive clients are attached, the client that most recently
+sent keyboard input owns PTY resizing. One-shot `rift send` and terminal
+responses do not take that ownership.
+
 Sessions are identified by name and communicate over a binary protocol (5-byte header: 1 tag + 4 LE length + payload). Framing is handled by `tokio-util::codec` (`ipc::RiftCodec`).
 
 ## Using with Terminal Emulators
@@ -117,12 +132,12 @@ wezterm cli split-pane -- rift attach dev.2
 kitty @ launch --type=window --cwd=current rift attach dev.2
 ```
 
-### Recipe: keybindings that spawn fresh rift panes (local & SSH)
+### Native Kitty integration
 
-A drop-in kitty + fish + bash setup that gives you `cmd+shift+t` /
-`cmd+shift+enter` to spawn a new rift-attached pane — locally *or* SSH'd back
-to the host you're already on — plus `rift-restore <host>` for re-establishing
-every remote session after a local reboot.
+The no-UI kitten gives `cmd+shift+t` / `cmd+shift+enter` a scoped way to
+spawn local or SSH-backed rift panes without enabling global Kitty remote
+control. On Kitty 0.43 or newer, `cmd+shift+s` saves only rift-attached panes
+in Kitty's native session format and `cmd+shift+r` restores them.
 
 See [`scripts/README.md`](scripts/README.md) for the full layout, install
 commands, and daily-use table.

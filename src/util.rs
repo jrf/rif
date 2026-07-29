@@ -5,7 +5,71 @@ use std::path::Path;
 use nix::unistd;
 
 use crate::ipc;
+use crate::label;
 use crate::socket;
+
+// -- Interactive input detection ---------------------------------------------
+
+#[derive(Default)]
+struct UserInputDetector {
+    found: bool,
+}
+
+impl vte::Perform for UserInputDetector {
+    fn print(&mut self, _c: char) {
+        self.found = true;
+    }
+
+    fn execute(&mut self, byte: u8) {
+        if matches!(byte, b'\r' | b'\n' | b'\t' | 0x08) {
+            self.found = true;
+        }
+    }
+
+    fn csi_dispatch(
+        &mut self,
+        params: &vte::Params,
+        _intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) {
+        match action {
+            'u' => {
+                let event_type = params
+                    .iter()
+                    .nth(1)
+                    .and_then(|param| param.get(1))
+                    .copied()
+                    .unwrap_or(1);
+                self.found = event_type != 3;
+            }
+            '~' | 'A'..='D' => self.found = true,
+            _ => {}
+        }
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        if intermediates == [b'O'] && matches!(byte, b'A'..=b'D' | b'P'..=b'S') {
+            self.found = true;
+        }
+    }
+
+    fn terminated(&self) -> bool {
+        self.found
+    }
+}
+
+/// Return whether a terminal-input payload contains intentional keyboard input.
+///
+/// Mouse reports, focus events, terminal capability responses, and kitty key
+/// release events do not count. The daemon uses this to transfer interactive
+/// leadership without letting terminal-generated replies steal resize ownership.
+pub fn is_user_input(payload: &[u8]) -> bool {
+    let mut parser = vte::Parser::new();
+    let mut detector = UserInputDetector::default();
+    parser.advance(&mut detector, payload);
+    detector.found
+}
 
 // -- Session listing ----------------------------------------------------------
 
@@ -20,6 +84,7 @@ pub struct SessionEntry {
     pub created_at: u64,
     pub task_ended_at: Option<u64>,
     pub task_exit_code: Option<u8>,
+    pub labels: Option<String>,
 }
 
 pub fn get_session_entries(socket_dir: &Path) -> io::Result<Vec<SessionEntry>> {
@@ -76,6 +141,10 @@ pub fn get_session_entries(socket_dir: &Path) -> io::Result<Vec<SessionEntry>> {
                 } else {
                     None
                 };
+                let labels = result
+                    .labels
+                    .as_deref()
+                    .map(|data| String::from_utf8_lossy(data).into_owned());
 
                 sessions.push(SessionEntry {
                     name,
@@ -92,6 +161,7 @@ pub fn get_session_entries(socket_dir: &Path) -> io::Result<Vec<SessionEntry>> {
                     } else {
                         None
                     },
+                    labels,
                 });
             }
             Err(ipc::ProbeError::ConnectionRefused) => {
@@ -107,6 +177,7 @@ pub fn get_session_entries(socket_dir: &Path) -> io::Result<Vec<SessionEntry>> {
                     created_at: 0,
                     task_ended_at: Some(0),
                     task_exit_code: Some(1),
+                    labels: None,
                 });
             }
             Err(ipc::ProbeError::Timeout) => {
@@ -121,6 +192,7 @@ pub fn get_session_entries(socket_dir: &Path) -> io::Result<Vec<SessionEntry>> {
                     created_at: 0,
                     task_ended_at: Some(0),
                     task_exit_code: Some(1),
+                    labels: None,
                 });
             }
             Err(e) => {
@@ -136,6 +208,7 @@ pub fn get_session_entries(socket_dir: &Path) -> io::Result<Vec<SessionEntry>> {
                     created_at: 0,
                     task_ended_at: Some(0),
                     task_exit_code: Some(1),
+                    labels: None,
                 });
             }
         }
@@ -201,6 +274,11 @@ pub fn write_session_line(
         write!(w, "\tended={}", ended_at)?;
         if let Some(exit_code) = session.task_exit_code {
             write!(w, "\texit_code={}", exit_code)?;
+        }
+    }
+    if let Some(labels) = session.labels.as_deref() {
+        for (key, value) in label::decode(labels) {
+            write!(w, "\t{}={}", key, value)?;
         }
     }
     if verbose {
@@ -590,8 +668,80 @@ fn leading_number(field: &[u8]) -> Option<u32> {
 /// Serialize the current terminal state for reattach.
 /// Returns the VT escape sequences needed to reproduce the screen.
 pub fn serialize_terminal_state(parser: &vt100::Parser) -> Option<Vec<u8>> {
-    let data = parser.screen().state_formatted();
+    let screen = parser.screen();
+    let mut data = Vec::new();
+    if screen.alternate_screen() {
+        data.extend_from_slice(b"\x1b[?1049h");
+    }
+    data.extend_from_slice(&screen.state_formatted());
     if data.is_empty() { None } else { Some(data) }
+}
+
+/// Force OSC 133 prompt markers to tell the outer terminal not to redraw.
+///
+/// Kitty shell integration otherwise clears prompt lines after resize while
+/// the real shell redraw travels through the daemon with inner-PTY coordinates.
+pub fn rewrite_prompt_redraw(data: &[u8]) -> Option<Vec<u8>> {
+    const MARKER: &[u8] = b"\x1b]133;A";
+
+    if !data.windows(MARKER.len()).any(|window| window == MARKER) {
+        return None;
+    }
+
+    let mut result = data.to_vec();
+    let mut search_end = result.len();
+    let mut changed = false;
+
+    while search_end > 0 {
+        let Some(position) = result[..search_end]
+            .windows(MARKER.len())
+            .rposition(|window| window == MARKER)
+        else {
+            break;
+        };
+        search_end = position;
+
+        let params_start = position + MARKER.len();
+        let Some(terminator) = find_osc_terminator(&result, params_start) else {
+            continue;
+        };
+        let params = &result[params_start..terminator];
+
+        if params
+            .windows(b"redraw=0".len())
+            .any(|window| window == b"redraw=0")
+        {
+            continue;
+        }
+
+        if let Some(offset) = params
+            .windows(b"redraw=".len())
+            .position(|window| window == b"redraw=")
+        {
+            let value_start = params_start + offset + b"redraw=".len();
+            let value_end = result[value_start..terminator]
+                .iter()
+                .position(|byte| *byte == b';')
+                .map_or(terminator, |offset| value_start + offset);
+            result.splice(value_start..value_end, [b'0']);
+        } else {
+            result.splice(terminator..terminator, *b";redraw=0");
+        }
+        changed = true;
+    }
+
+    changed.then_some(result)
+}
+
+fn find_osc_terminator(data: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    while index < data.len() {
+        if data[index] == 0x07 || (data[index] == 0x1b && data.get(index + 1) == Some(&b'\\')) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -722,6 +872,45 @@ pub fn filter_tail_output(data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn terminal(rows: u16, cols: u16, data: &[u8]) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(rows, cols, 10_000);
+        parser.process(data);
+        parser
+    }
+
+    fn terminal_roundtrip(source: &vt100::Parser) -> vt100::Parser {
+        let (rows, cols) = source.screen().size();
+        let mut destination = vt100::Parser::new(rows, cols, 10_000);
+        destination.process(
+            &serialize_terminal_state(source).expect("terminal state should not be empty"),
+        );
+        destination
+    }
+
+    fn assert_visible_state_matches(expected: &vt100::Parser, actual: &vt100::Parser) {
+        assert_eq!(actual.screen().contents(), expected.screen().contents());
+        assert_eq!(
+            actual.screen().cursor_position(),
+            expected.screen().cursor_position()
+        );
+        assert_eq!(
+            actual.screen().hide_cursor(),
+            expected.screen().hide_cursor()
+        );
+        assert_eq!(
+            actual.screen().bracketed_paste(),
+            expected.screen().bracketed_paste()
+        );
+        assert_eq!(
+            actual.screen().application_cursor(),
+            expected.screen().application_cursor()
+        );
+        assert_eq!(
+            actual.screen().application_keypad(),
+            expected.screen().application_keypad()
+        );
+    }
+
     #[test]
     fn task_completion_scanner_handles_split_records() {
         let mut carry = Vec::new();
@@ -773,5 +962,124 @@ mod tests {
             device_attribute_responses(b"one\x1b[c two\x1b[>0c"),
             [DA1_RESPONSE, DA2_RESPONSE].concat()
         );
+    }
+
+    #[test]
+    fn user_input_detector_ignores_terminal_generated_events() {
+        assert!(!is_user_input(b"\x1b[<0;12;4M"));
+        assert!(!is_user_input(b"\x1b[I"));
+        assert!(!is_user_input(b"\x1b[?1;2c"));
+        assert!(!is_user_input(b"\x1b[102;1:3u"));
+    }
+
+    #[test]
+    fn user_input_detector_accepts_keyboard_input() {
+        assert!(is_user_input(b"text"));
+        assert!(is_user_input(b"\r"));
+        assert!(is_user_input(b"\x1b[A"));
+        assert!(is_user_input(b"\x1b[102;1:1u"));
+        assert!(is_user_input(b"\x1b[200~pasted\x1b[201~"));
+    }
+
+    #[test]
+    fn prompt_redraw_is_added_or_replaced() {
+        assert_eq!(
+            rewrite_prompt_redraw(b"\x1b]133;A\x07"),
+            Some(b"\x1b]133;A;redraw=0\x07".to_vec())
+        );
+        assert_eq!(
+            rewrite_prompt_redraw(b"\x1b]133;A;aid=2;redraw=last\x1b\\"),
+            Some(b"\x1b]133;A;aid=2;redraw=0\x1b\\".to_vec())
+        );
+        assert_eq!(rewrite_prompt_redraw(b"\x1b]133;A;redraw=0\x07"), None);
+    }
+
+    #[test]
+    fn terminal_state_roundtrip_preserves_positioned_content_and_modes() {
+        let source = terminal(
+            24,
+            80,
+            b"\x1b[2J\x1b[2;5HMARK_A\x1b[10;30HMARK_B\
+              \x1b[16;20H\x1b[?1h\x1b=\x1b[?25l\x1b[?2004h",
+        );
+        let destination = terminal_roundtrip(&source);
+
+        assert_visible_state_matches(&source, &destination);
+    }
+
+    #[test]
+    fn terminal_state_roundtrip_preserves_visible_content_after_scrollback() {
+        let mut source = terminal(24, 80, b"");
+        for line in 0..80 {
+            source.process(format!("SCROLL_{line}\r\n").as_bytes());
+        }
+        source.process(
+            b"\x1b[2J\x1b[2;5HMARK_A\x1b[6;15HMARK_B\
+              \x1b[10;30HMARK_C\x1b[16;20H",
+        );
+        let destination = terminal_roundtrip(&source);
+
+        assert_visible_state_matches(&source, &destination);
+    }
+
+    #[test]
+    fn terminal_state_nested_roundtrip_preserves_visible_state() {
+        let mut inner = terminal(24, 80, b"");
+        for line in 0..60 {
+            inner.process(format!("SCROLL_{line}\r\n").as_bytes());
+        }
+        inner.process(b"\x1b[2J\x1b[3;10HINNER_A\x1b[12;25HINNER_B\x1b[20;5H");
+
+        let outer = terminal_roundtrip(&inner);
+        let destination = terminal_roundtrip(&outer);
+
+        assert_visible_state_matches(&inner, &destination);
+    }
+
+    #[test]
+    fn terminal_state_roundtrip_does_not_leak_inactive_alternate_screen() {
+        let source = terminal(
+            24,
+            80,
+            b"\x1b[?1049h\x1b[2J\x1b[3;10HALT_MARK\
+              \x1b[?1049l\x1b[2J\x1b[2;5HMAIN_MARK\x1b[8;20H",
+        );
+        let destination = terminal_roundtrip(&source);
+
+        assert_visible_state_matches(&source, &destination);
+        assert!(!destination.screen().contents().contains("ALT_MARK"));
+        assert!(!destination.screen().alternate_screen());
+    }
+
+    #[test]
+    fn terminal_state_roundtrip_preserves_active_alternate_screen() {
+        let source = terminal(24, 80, b"\x1b[?1049h\x1b[2J\x1b[3;10HALT_MARK\x1b[8;20H");
+        let destination = terminal_roundtrip(&source);
+
+        assert_visible_state_matches(&source, &destination);
+        assert!(destination.screen().alternate_screen());
+    }
+
+    #[test]
+    fn terminal_state_roundtrip_after_resize_preserves_visible_state() {
+        let mut source = terminal(
+            30,
+            80,
+            b"\x1b[2J\x1b[3;10HSIZE_A\x1b[12;20HSIZE_B\
+              \x1b[20;40HSIZE_C\x1b[15;15H",
+        );
+        source.screen_mut().set_size(24, 80);
+        let destination = terminal_roundtrip(&source);
+
+        assert_visible_state_matches(&source, &destination);
+    }
+
+    #[test]
+    fn terminal_state_excludes_synchronized_output_replay() {
+        let source = terminal(24, 80, b"\x1b[?2004h\x1b[?2026hhello");
+        let serialized = serialize_terminal_state(&source).expect("terminal state");
+
+        assert!(serialized.windows(8).any(|window| window == b"\x1b[?2004h"));
+        assert!(!serialized.windows(8).any(|window| window == b"\x1b[?2026h"));
     }
 }

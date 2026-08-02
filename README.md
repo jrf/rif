@@ -21,8 +21,9 @@ cargo build       # direct cargo
 
 ```
 rift                          Pick a session interactively ($RIFT_PICKER or builtin)
-rift <session>                Attach to (or create) a session
-rift attach <session>         Same as above
+rift <name-or-command> [...]  Attach existing; otherwise run a PATH command or named shell
+rift --new <command> [...]    Run command in next free basename session (name, name.1, ...)
+rift attach <session>         Explicitly attach to (or create) a shell session
 rift attach -d <session>      Create session without attaching
 rift new <session>            Same as attach -d
 rift list [-s|-v] [--where k=v] List sessions, optionally filtered by label
@@ -55,6 +56,12 @@ All subcommands have short aliases: `a`, `n`, `r`, `s`, `p`, `wr`, `t`, `hi`, `l
 # Start a session named "dev"
 rift dev
 
+# Start Codex in a session automatically named "codex"
+rift codex
+
+# Start another Codex session named "codex.1" (then codex.2, etc.)
+rift --new codex
+
 # Detach with Ctrl+\, then reattach later
 rift dev
 
@@ -78,6 +85,13 @@ rift list
 rift set dev project=rift env=dev
 rift list --where project=rift
 ```
+
+For bare names, an existing session takes precedence over a command with the
+same name. If no session exists, Rift runs an executable found in `PATH`; if no
+executable is found and there are no arguments, it creates a shell session with
+that name. Use `rift attach <name>` to always request shell/session behavior.
+Rift subcommand names remain reserved; use `rift --new <command>` to run a
+same-named executable.
 
 ## Environment Variables
 

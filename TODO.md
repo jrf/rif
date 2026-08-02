@@ -12,6 +12,7 @@
 ## Scrapped
 
 ## Done
+- [x] Smart bare commands — `rift <command> [args...]` derives the session name from the executable, existing sessions take precedence, and `rift --new <command>` allocates `name`, `name.1`, and later suffixes #feature
 - [x] Session labels — sorted `get`, `set`, `unset`, and `clear`; label rendering and `list --where key=value`; shell completions; frozen tag values; and list compatibility with daemons that predate label tags #feature
 - [x] Scoped Kitty integration — the no-UI kitten uses Kitty's supported remote-control API without global permission, launches `rift-pane` directly, preserves `kitten ssh`, and binds filtered native session save/restore on Kitty 0.43+ #feature
 - [x] Terminal reattach corpus — cursor and positioned content, visible state after scrollback, active and inactive alternate screens, resize, nested replay, input modes, and synchronized-output filtering; active alternate-screen mode is now restored explicitly #improvement

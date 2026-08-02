@@ -1,10 +1,13 @@
 use std::fs;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use nix::pty::openpty;
 
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -45,6 +48,25 @@ impl RiftTest {
             .unwrap_or_else(|error| panic!("spawn rift {args:?}: {error}"))
     }
 
+    fn spawn_pty(&self, args: &[&str]) -> (Child, File) {
+        let pty = openpty(None, None).expect("open test PTY");
+        let master = File::from(pty.master);
+        let slave = File::from(pty.slave);
+        let child = self
+            .command()
+            .args(args)
+            .stdin(Stdio::from(
+                slave.try_clone().expect("clone PTY slave for stdin"),
+            ))
+            .stdout(Stdio::from(
+                slave.try_clone().expect("clone PTY slave for stdout"),
+            ))
+            .stderr(Stdio::from(slave))
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn PTY rift {args:?}: {error}"));
+        (child, master)
+    }
+
     fn wait_for_session(&self, name: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -57,6 +79,15 @@ impl RiftTest {
         }
         panic!("session {name:?} did not appear");
     }
+}
+
+fn stop_pty_child(mut child: Child, _master: File) {
+    assert!(
+        child.try_wait().expect("poll PTY child").is_none(),
+        "PTY client exited before the session could be inspected"
+    );
+    child.kill().expect("stop PTY client");
+    child.wait().expect("reap PTY client");
 }
 
 impl Drop for RiftTest {
@@ -285,6 +316,60 @@ fn detached_custom_command_resolves_from_path_without_arguments() {
     );
 
     test.wait_for_session("path-command");
+}
+
+#[test]
+fn smart_commands_use_executable_basenames_and_allocate_suffixes() {
+    let test = RiftTest::new();
+
+    let (first, first_pty) = test.spawn_pty(&["--new", "cat"]);
+    test.wait_for_session("cat");
+    stop_pty_child(first, first_pty);
+
+    let (second, second_pty) = test.spawn_pty(&["--new", "cat"]);
+    test.wait_for_session("cat.1");
+    stop_pty_child(second, second_pty);
+
+    let sessions = String::from_utf8_lossy(&test.output(&["list", "--short"]).stdout).into_owned();
+    assert_eq!(sessions, "cat\ncat.1\n");
+}
+
+#[test]
+fn smart_bare_name_prefers_an_existing_session_even_with_arguments() {
+    let test = RiftTest::new();
+    assert!(test.output(&["new", "not-a-real-command"]).status.success());
+    test.wait_for_session("not-a-real-command");
+
+    let (child, pty) = test.spawn_pty(&["not-a-real-command", "ignored-argument"]);
+    stop_pty_child(child, pty);
+
+    let sessions = String::from_utf8_lossy(&test.output(&["list", "--short"]).stdout).into_owned();
+    assert_eq!(sessions, "not-a-real-command\n");
+}
+
+#[test]
+fn smart_command_forwards_arguments_to_the_pty_process() {
+    let test = RiftTest::new();
+    let (child, pty) = test.spawn_pty(&["--new", "sleep", "30"]);
+    test.wait_for_session("sleep");
+
+    let listed = String::from_utf8_lossy(&test.output(&["list"]).stdout).into_owned();
+    assert!(listed.contains("name=sleep\t"), "{listed}");
+    assert!(listed.contains("sleep 30"), "{listed}");
+    stop_pty_child(child, pty);
+}
+
+#[test]
+fn forced_smart_command_rejects_an_unknown_executable() {
+    let test = RiftTest::new();
+    let output = test.output(&["--new", "rift-test-command-that-does-not-exist"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("command not found in PATH"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

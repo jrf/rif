@@ -1,6 +1,7 @@
 use std::io::{self, IsTerminal, Read};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -945,6 +946,14 @@ pub fn cmd_logs(name: &str, extra_args: &[String]) -> i32 {
 // ---------------------------------------------------------------------------
 
 pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
+    cmd_attach_with_policy(name, detached, cmd, true)
+}
+
+fn cmd_attach_new(name: &str, cmd: &[String]) -> i32 {
+    cmd_attach_with_policy(name, false, cmd, false)
+}
+
+fn cmd_attach_with_policy(name: &str, detached: bool, cmd: &[String], allow_existing: bool) -> i32 {
     let current = socket::session_name_from_env();
     if !current.is_empty() {
         eprintln!("error: already inside session '{}'", current);
@@ -974,7 +983,7 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
 
     match socket::session_exists(&cfg.socket_dir, &cfg.session_name) {
         Ok(true) => {
-            if detached {
+            if detached || !allow_existing {
                 eprintln!("error: session '{}' already exists", name);
                 return 1;
             }
@@ -1021,6 +1030,87 @@ pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
     let code = daemon::run_client(socket_fd);
     util::run_hook("RIFT_ON_DETACH", &cfg.session_name);
     code
+}
+
+pub fn cmd_smart(program: &str, args: &[String], force_new: bool) -> i32 {
+    let Some(base_name) = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+    else {
+        eprintln!("error: cannot derive a session name from command '{program}'");
+        return 1;
+    };
+
+    let executable = find_executable(program);
+    if executable.is_none() && !force_new && !args.is_empty() && session_is_connectable(base_name) {
+        return cmd_attach(base_name, false, &[]);
+    }
+    if executable.is_none() && (force_new || !args.is_empty()) {
+        eprintln!("error: command not found in PATH: {program}");
+        return 1;
+    }
+
+    let command = executable.map_or_else(Vec::new, |path| {
+        let mut command = Vec::with_capacity(args.len() + 1);
+        command.push(path.to_string_lossy().into_owned());
+        command.extend_from_slice(args);
+        command
+    });
+
+    if !force_new {
+        return cmd_attach(base_name, false, &command);
+    }
+
+    let Some(name) = next_command_session_name(base_name) else {
+        eprintln!("error: could not allocate a session name for '{base_name}'");
+        return 1;
+    };
+    cmd_attach_new(&name, &command)
+}
+
+fn find_executable(program: &str) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        return is_executable(path).then(|| path.to_path_buf());
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(program))
+        .find(|path| is_executable(path))
+}
+
+fn is_executable(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+fn session_is_connectable(name: &str) -> bool {
+    let Ok(cfg) = Cfg::resolve(name) else {
+        return false;
+    };
+    let Some(path) = cfg.socket_path.to_str() else {
+        return false;
+    };
+    socket::session_connect(path).is_ok()
+}
+
+fn next_command_session_name(base_name: &str) -> Option<String> {
+    let prefix = socket::session_prefix();
+    let socket_dir = socket::socket_dir();
+    let mut index = 0usize;
+    loop {
+        let candidate = if index == 0 {
+            base_name.to_string()
+        } else {
+            format!("{base_name}.{index}")
+        };
+        let full_name = socket::get_session_name(&prefix, &candidate).ok()?;
+        if !socket::session_exists(&socket_dir, &full_name).ok()? {
+            return Some(candidate);
+        }
+        index = index.checked_add(1)?;
+    }
 }
 
 // ---------------------------------------------------------------------------

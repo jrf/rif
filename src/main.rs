@@ -15,6 +15,11 @@ use crate::util::HistoryFormat;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
+    Smart {
+        program: String,
+        args: Vec<String>,
+        force_new: bool,
+    },
     Attach {
         name: String,
         detached: bool,
@@ -124,10 +129,24 @@ fn parse_session_command(
 }
 
 fn parse_args() -> Command {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    parse_args_from(std::env::args().skip(1).collect())
+}
 
+fn parse_args_from(args: Vec<String>) -> Command {
     if args.is_empty() {
         return Command::Pick;
+    }
+
+    if args[0] == "--new" {
+        let Some(program) = args.get(1) else {
+            eprintln!("error: --new requires a command");
+            std::process::exit(1);
+        };
+        return Command::Smart {
+            program: program.clone(),
+            args: args[2..].to_vec(),
+            force_new: true,
+        };
     }
 
     let first = args[0].as_str();
@@ -351,15 +370,15 @@ fn parse_args() -> Command {
                 cmd,
             }
         }
-        name => {
-            if name.starts_with('-') {
-                eprintln!("error: unknown option '{}'", name);
+        program => {
+            if program.starts_with('-') {
+                eprintln!("error: unknown option '{}'", program);
                 std::process::exit(1);
             }
-            Command::Attach {
-                name: name.to_string(),
-                detached: false,
-                cmd: vec![],
+            Command::Smart {
+                program: program.to_string(),
+                args: args[1..].to_vec(),
+                force_new: false,
             }
         }
     }
@@ -376,6 +395,11 @@ fn main() {
             print_help();
             0
         }
+        Command::Smart {
+            program,
+            args,
+            force_new,
+        } => commands::cmd_smart(&program, &args, force_new),
         Command::Version => {
             let dir = socket::socket_dir();
             println!("rift {}", env!("CARGO_PKG_VERSION"));
@@ -430,8 +454,9 @@ rift — terminal session daemon
 
 Usage:
   rift                          Pick a session interactively ($RIFT_PICKER or builtin)
-  rift <session>                Attach to (or create) a session
-  rift attach|a <session>       Same as above (optional <cmd> to run instead of shell)
+  rift <name-or-command> [...]  Attach existing; otherwise run a PATH command or named shell
+  rift --new <command> [...]    Run command in next free basename session (name, name.1, ...)
+  rift attach|a <session>       Explicit session attach/create (optional <cmd> instead of shell)
   rift attach -d <session>      Create session without attaching
   rift new|n <session>          Same as attach -d
   rift list|ls|l [-s|-v] [--where k=v]
@@ -502,6 +527,30 @@ mod tests {
         assert_eq!(
             parse_session_command(&strings(&["--", "-session", "command"]), true, false),
             Ok(("-session".to_string(), strings(&["command"]), false, false))
+        );
+    }
+
+    #[test]
+    fn bare_command_preserves_arguments_for_smart_resolution() {
+        assert_eq!(
+            parse_args_from(strings(&["codex", "--model", "gpt-5"])),
+            Command::Smart {
+                program: "codex".to_string(),
+                args: strings(&["--model", "gpt-5"]),
+                force_new: false,
+            }
+        );
+    }
+
+    #[test]
+    fn new_flag_requests_an_allocated_command_session() {
+        assert_eq!(
+            parse_args_from(strings(&["--new", "codex", "--model", "gpt-5"])),
+            Command::Smart {
+                program: "codex".to_string(),
+                args: strings(&["--model", "gpt-5"]),
+                force_new: true,
+            }
         );
     }
 }

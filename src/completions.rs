@@ -17,14 +17,18 @@ const BASH: &str = r#"_rift_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local commands="attach new run send print write tail detach list get set unset clear completions kill history wait version help rename rn logs lg last la"
+  local commands="--new attach new run send print write tail detach list get set unset clear completions kill history wait version help rename rn logs lg last la"
 
   if [[ $COMP_CWORD -eq 1 ]]; then
-    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+    local sessions=$(rift list --short 2>/dev/null | tr '\n' ' ')
+    COMPREPLY=($(compgen -W "$commands $sessions" -- "$cur") $(compgen -c -- "$cur"))
     return 0
   fi
 
   case "$prev" in
+    --new)
+      COMPREPLY=($(compgen -c -- "$cur"))
+      ;;
     attach|a|new|n|run|r|send|s|print|p|write|wr|tail|t|kill|k|history|hi|detach|d|wait|w|rename|rn|logs|lg|get|g|set|unset|un|clear|cl)
       local sessions=$(rift list --short 2>/dev/null | tr '\n' ' ')
       COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
@@ -48,6 +52,7 @@ const ZSH: &str = r#"_rift() {
   typeset -A opt_args
 
   _arguments -C \
+    '--new[Run command in a new automatically named session]:command:_command_names' \
     '1: :->commands' \
     '2: :->args' \
     '*: :->trailing' \
@@ -80,7 +85,8 @@ const ZSH: &str = r#"_rift() {
         'version:Print version'
         'help:Print help'
       )
-      _describe 'command' commands
+      _describe 'rift command' commands
+      _command_names
       ;;
     args)
       case $words[2] in
@@ -116,6 +122,8 @@ compdef _rift rift
 
 const FISH: &str = r#"complete -c rift -f
 
+complete -c rift -l new -r -a '(__fish_complete_command)' -d 'Run command in a new automatically named session'
+
 complete -c rift -n "__fish_is_nth_token 1" -a 'a attach' -d 'Attach to session, creating if needed'
 complete -c rift -n "__fish_is_nth_token 1" -a 'n new' -d 'Create session without attaching'
 complete -c rift -n "__fish_is_nth_token 1" -a 'r run' -d 'Run a command in a session'
@@ -140,6 +148,7 @@ complete -c rift -n "__fish_is_nth_token 1" -a 'v version' -d 'Print version'
 complete -c rift -s V -l version -d 'Print version'
 complete -c rift -n "__fish_is_nth_token 1" -a 'h help' -d 'Print help'
 complete -c rift -s h -d 'Print help'
+complete -c rift -n "__fish_is_nth_token 1" -a '(__fish_complete_command)' -d 'Command'
 
 complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr tail t kill k detach d history hi wait w rename rn logs lg get g set unset un clear cl" -a '(rift list --short 2>/dev/null)' -d 'Session name'
 
@@ -163,6 +172,11 @@ const NU: &str = r#"def "nu-complete rift sessions" [] {
 def "nu-complete rift shells" [] {
   [bash zsh fish nu]
 }
+
+export extern rift [
+  --new: string
+  ...rest: string
+]
 
 export extern "rift attach" [
   name: string@"nu-complete rift sessions"

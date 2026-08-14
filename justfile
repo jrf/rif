@@ -12,14 +12,14 @@ release:
 run:
     cargo run
 
-# Install to ~/.local/bin
-install: release
-    cp target/release/rift ~/.local/bin/
-    codesign -s - ~/.local/bin/rift
+# Install to the cargo bin path (~/.cargo/bin by default)
+install:
+    cargo install --path . --force
+    codesign -s - "{{ env('CARGO_HOME', env('HOME') / '.cargo') }}/bin/rift"
 
-# Uninstall from ~/.local/bin
+# Uninstall from the cargo bin path
 uninstall:
-    rm -f ~/.local/bin/rift
+    cargo uninstall rift
 
 # Remove build artifacts
 clean:

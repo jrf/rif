@@ -4,7 +4,7 @@
 
 ## Next
 - [ ] Replace `vt100` with a terminal-state backend that can replay full styled scrollback, scrolling regions, OSC 7 working directories, and Kitty keyboard mode state; keep the cursor, viewport, alternate-screen, resize, synchronized-output, and nested-session corpus as acceptance tests #improvement
-- [ ] Add in-session switching and side-effect-free subcommand help #feature
+- [ ] Add in-session switching #feature
 
 ## Later
 - [ ] Publish versioned macOS/Linux release artifacts and package metadata for Homebrew, Mise, and Nix #chore
@@ -12,12 +12,13 @@
 ## Scrapped
 
 ## Done
+- [x] Runtime parity fixes — headless `run` terminal sizing, sane `TERM` fallback, optional detach-key disablement, and side-effect-free subcommand help #bug
 - [x] Smart bare commands — `rift <command> [args...]` derives the session name from the executable, existing sessions take precedence, and `rift --new <command>` allocates `name`, `name.1`, and later suffixes #feature
 - [x] Session labels — sorted `get`, `set`, `unset`, and `clear`; label rendering and `list --where key=value`; shell completions; frozen tag values; and list compatibility with daemons that predate label tags #feature
 - [x] Scoped Kitty integration — the no-UI kitten uses Kitty's supported remote-control API without global permission, launches `rift-pane` directly, preserves `kitten ssh`, and binds filtered native session save/restore on Kitty 0.43+ #feature
 - [x] Terminal reattach corpus — cursor and positioned content, visible state after scrollback, active and inactive alternate screens, resize, nested replay, input modes, and synchronized-output filtering; active alternate-screen mode is now restored explicitly #improvement
 - [x] Custom PTY commands resolve through `PATH` and commands without arguments no longer receive login-shell `argv[0]` behavior #bug
-- [x] zmx parity core tranche — piped multiline `run` with heredocs, interactive client leadership, Kitty OSC 133 prompt redraw handling, failed-task history, disappearance-safe `wait`, and isolated CLI integration tests #improvement
+- [x] Runtime reliability core tranche — piped multiline `run` with heredocs, interactive client leadership, Kitty OSC 133 prompt redraw handling, failed-task history, disappearance-safe `wait`, and isolated CLI integration tests #improvement
 - [x] Kitty keyboard flags survive detach via push/pop — push 0 at attach (outer flags preserved on the kbd stack as a side effect), pop 1 at detach. Beats query/set: inner-shell `CSI = u` SETs don't touch the stack, so the pop restores outer flags exactly regardless of what the session did, and there's no SSH-RTT query window to time out. Also robust Ctrl+\ detect across all kbd-flag combinations (alternate keys, event types, associated text), and 1016 SGR-pixel mouse added to the reset set #refactor
 - [x] Kitty keyboard flags survive detach — query outer-terminal flags at attach (`CSI ? u`, 80ms timeout) and re-set them on detach so an inner shell's `CSI = flags u` doesn't leak `N;5u` Ctrl-key sequences into the user's outer shell. Pop count on stack drain bumped from 1 to 99 #bug
 - [x] `rift last` self-heals — if the recorded session is gone, clear `.last` and fall back to the picker instead of erroring #improvement

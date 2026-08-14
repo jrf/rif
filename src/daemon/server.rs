@@ -125,6 +125,12 @@ fn spawn_pty(
             let val = std::ffi::CString::new(session_name).unwrap();
             libc::setenv(key.as_ptr(), val.as_ptr(), 1);
 
+            let term_key = c"TERM";
+            let term = libc::getenv(term_key.as_ptr());
+            if term.is_null() || std::ffi::CStr::from_ptr(term).to_bytes() == b"dumb" {
+                libc::setenv(term_key.as_ptr(), c"xterm-256color".as_ptr(), 1);
+            }
+
             let sock_dir = socket::socket_dir();
             let symlink_path = sock_dir.join(format!("{}.ssh-auth-sock", session_name));
             if let Some(symlink_str) = symlink_path.to_str() {

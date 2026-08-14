@@ -596,6 +596,12 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
         )
     };
 
+    let size = ipc::get_terminal_size(libc::STDOUT_FILENO);
+    if let Err(e) = ipc::send(socket_fd.as_raw_fd(), Tag::Resize, &size.encode()) {
+        eprintln!("error: failed to send terminal size: {}", e);
+        return 1;
+    }
+
     if let Err(e) = ipc::send(socket_fd.as_raw_fd(), Tag::Run, wrapped.as_bytes()) {
         eprintln!("error: failed to send command: {}", e);
         return 1;

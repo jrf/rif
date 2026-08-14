@@ -167,16 +167,43 @@ impl Info {
 }
 
 pub fn get_terminal_size(fd: RawFd) -> Resize {
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
-            return Resize {
-                rows: ws.ws_row,
-                cols: ws.ws_col,
-            };
+    for candidate in [
+        fd,
+        libc::STDOUT_FILENO,
+        libc::STDIN_FILENO,
+        libc::STDERR_FILENO,
+    ] {
+        if let Some(size) = terminal_size(candidate) {
+            return size;
         }
     }
-    Resize { rows: 24, cols: 80 }
+
+    let tty = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if tty >= 0 {
+        let size = terminal_size(tty);
+        unsafe {
+            libc::close(tty);
+        }
+        if let Some(size) = size {
+            return size;
+        }
+    }
+
+    Resize {
+        rows: 24,
+        cols: 120,
+    }
+}
+
+fn terminal_size(fd: RawFd) -> Option<Resize> {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        (libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0)
+            .then_some(Resize {
+                rows: ws.ws_row,
+                cols: ws.ws_col,
+            })
+    }
 }
 
 pub fn encode_header(tag: Tag, len: u32) -> [u8; HEADER_SIZE] {

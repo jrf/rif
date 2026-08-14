@@ -104,6 +104,7 @@ same-named executable.
 | `RIFT_DIR_MODE` | Permission mode for socket directory (default: `0700`) |
 | `RIFT_LOG_MODE` | Permission mode for log files (default: `0600`) |
 | `RIFT_EMPTY_TIMEOUT` | Idle duration (in seconds) after which a detached session with 0 clients will automatically terminate (e.g., `3600` for 1 hour) |
+| `RIFT_NO_DETACH_KEY` | Disable the `Ctrl+\` detach shortcut when set; detach by closing the terminal or running `rift detach` |
 | `RIFT_PICKER` | Shell command to use as session picker when `rift` is run with no args (e.g., `fzf`); receives session names on stdin, must print selection on stdout. Default: built-in numbered prompt. |
 | `RIFT_ON_ATTACH` | Shell snippet run when a client attaches (fire-and-forget, stdio detached). `$RIFT_SESSION` is set and the session name is also passed as `$1`. |
 | `RIFT_ON_DETACH` | Shell snippet run when a client detaches. Same context as `RIFT_ON_ATTACH`. |

@@ -53,6 +53,10 @@ const KBD_PUSH_RESET: &[u8] = b"\x1b[>0u";
 /// current when we pushed at attach.
 const KBD_POP: &[u8] = b"\x1b[<1u";
 
+fn should_detach(data: &[u8], disabled: bool) -> bool {
+    !disabled && (data.contains(&0x1c) || util::is_kitty_ctrl_backslash(data))
+}
+
 // ---------------------------------------------------------------------------
 // Terminal raw mode
 // ---------------------------------------------------------------------------
@@ -274,6 +278,8 @@ pub fn run_client(socket: OwnedFd) -> i32 {
 async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd) {
     use futures_util::{SinkExt, StreamExt};
 
+    let detach_key_disabled = std::env::var_os("RIFT_NO_DETACH_KEY").is_some();
+
     let (read_half, write_half) = stream.into_split();
     let mut reader = FramedRead::new(read_half, RiftCodec);
     let mut writer = FramedWrite::new(write_half, RiftCodec);
@@ -335,7 +341,7 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
                 match try_read(ready, &mut stdin_buf) {
                     IoStep::Bytes(n) => {
                         let data = &stdin_buf[..n];
-                        if data.contains(&0x1c) || util::is_kitty_ctrl_backslash(data) {
+                        if should_detach(data, detach_key_disabled) {
                             let _ = writer.send((Tag::Detach, Bytes::new())).await;
                             break;
                         }
@@ -414,4 +420,17 @@ fn write_bytes(fd: RawFd, bytes: &[u8]) {
         }
     }
     let _ = termios::tcdrain(bfd);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_detach;
+
+    #[test]
+    fn detach_key_can_be_disabled() {
+        assert!(should_detach(&[0x1c], false));
+        assert!(should_detach(b"\x1b[92;5u", false));
+        assert!(!should_detach(&[0x1c], true));
+        assert!(!should_detach(b"\x1b[92;5u", true));
+    }
 }

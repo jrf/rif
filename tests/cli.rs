@@ -426,3 +426,90 @@ fn invalid_or_reserved_labels_are_rejected_without_mutation() {
     assert!(String::from_utf8_lossy(&reserved.stderr).contains("read-only built-in field"));
     assert!(test.output(&["get", "label-validation"]).stdout.is_empty());
 }
+
+#[test]
+fn subcommand_help_does_not_create_sessions() {
+    let test = RiftTest::new();
+
+    for command in ["attach", "run", "send", "kill", "history", "--new"] {
+        let output = test.output(&[command, "--help"]);
+        assert!(
+            output.status.success(),
+            "rift {command} --help failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("Usage:"),
+            "rift {command} --help did not print help"
+        );
+    }
+
+    assert!(test.output(&["list", "--short"]).stdout.is_empty());
+}
+
+#[test]
+fn detached_run_uses_sane_size_without_a_terminal() {
+    let test = RiftTest::new();
+    let run = test.output(&[
+        "run",
+        "--detached",
+        "headless-size",
+        "sh",
+        "-c",
+        "stty size",
+    ]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let wait = test.output(&["wait", "headless-size"]);
+    assert!(
+        wait.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wait.stderr)
+    );
+    let history = test.output(&["history", "headless-size"]);
+    assert!(
+        String::from_utf8_lossy(&history.stdout).contains("24 120"),
+        "{}",
+        String::from_utf8_lossy(&history.stdout)
+    );
+}
+
+#[test]
+fn dumb_term_is_replaced_for_session_commands() {
+    let test = RiftTest::new();
+    let output = test
+        .command()
+        .env("TERM", "dumb")
+        .args([
+            "run",
+            "--detached",
+            "term-fallback",
+            "sh",
+            "-c",
+            "printf 'TERM=%s\\n' \"$TERM\"",
+        ])
+        .output()
+        .expect("run TERM fallback command");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let wait = test.output(&["wait", "term-fallback"]);
+    assert!(
+        wait.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wait.stderr)
+    );
+    let history = test.output(&["history", "term-fallback"]);
+    assert!(
+        String::from_utf8_lossy(&history.stdout).contains("TERM=xterm-256color"),
+        "{}",
+        String::from_utf8_lossy(&history.stdout)
+    );
+}

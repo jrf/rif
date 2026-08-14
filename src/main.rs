@@ -137,6 +137,10 @@ fn parse_args_from(args: Vec<String>) -> Command {
         return Command::Pick;
     }
 
+    if is_subcommand(&args[0]) && args.get(1).is_some_and(|arg| is_help_flag(arg)) {
+        return Command::Help;
+    }
+
     if args[0] == "--new" {
         let Some(program) = args.get(1) else {
             eprintln!("error: --new requires a command");
@@ -384,6 +388,61 @@ fn parse_args_from(args: Vec<String>) -> Command {
     }
 }
 
+fn is_help_flag(arg: &str) -> bool {
+    matches!(arg, "--help" | "-h")
+}
+
+fn is_subcommand(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--new"
+            | "attach"
+            | "a"
+            | "new"
+            | "n"
+            | "list"
+            | "ls"
+            | "l"
+            | "get"
+            | "g"
+            | "set"
+            | "unset"
+            | "un"
+            | "clear"
+            | "cl"
+            | "kill"
+            | "k"
+            | "detach"
+            | "d"
+            | "run"
+            | "r"
+            | "send"
+            | "s"
+            | "print"
+            | "p"
+            | "write"
+            | "wr"
+            | "tail"
+            | "t"
+            | "history"
+            | "hi"
+            | "wait"
+            | "w"
+            | "rename"
+            | "rn"
+            | "completions"
+            | "c"
+            | "logs"
+            | "lg"
+            | "last"
+            | "la"
+            | "version"
+            | "v"
+            | "help"
+            | "h"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -552,5 +611,31 @@ mod tests {
                 force_new: true,
             }
         );
+    }
+
+    #[test]
+    fn subcommand_help_is_detected_before_operands_are_parsed() {
+        for command in [
+            "attach",
+            "run",
+            "send",
+            "list",
+            "history",
+            "kill",
+            "set",
+            "completions",
+            "--new",
+        ] {
+            assert_eq!(
+                parse_args_from(strings(&[command, "--help"])),
+                Command::Help,
+                "command={command}"
+            );
+            assert_eq!(
+                parse_args_from(strings(&[command, "-h"])),
+                Command::Help,
+                "command={command}"
+            );
+        }
     }
 }

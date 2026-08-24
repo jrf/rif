@@ -972,8 +972,14 @@ fn cmd_attach_new(name: &str, cmd: &[String]) -> i32 {
 fn cmd_attach_with_policy(name: &str, detached: bool, cmd: &[String], allow_existing: bool) -> i32 {
     let current = socket::session_name_from_env();
     if !current.is_empty() {
-        eprintln!("error: already inside session '{}'", current);
-        return 1;
+        // We're running *inside* a rift session. Rather than refuse, ask the
+        // current session's daemon to switch the interactive user over to the
+        // requested session (tmux/zmx-style in-session switching). A detached
+        // spawn (`--detached`) still just creates the session in the background.
+        if detached {
+            return spawn_detached(name, cmd);
+        }
+        return request_switch(&current, name);
     }
 
     let cfg = match Cfg::resolve(name) {
@@ -1005,11 +1011,7 @@ fn cmd_attach_with_policy(name: &str, detached: bool, cmd: &[String], allow_exis
             }
             match socket::session_connect(&path_str) {
                 Ok(fd) => {
-                    util::write_last_session(&cfg.socket_dir, name);
-                    util::run_hook("RIFT_ON_ATTACH", &cfg.session_name);
-                    let code = daemon::run_client(fd);
-                    util::run_hook("RIFT_ON_DETACH", &cfg.session_name);
-                    return code;
+                    return attach_and_follow_switches(cfg, name.to_string(), fd);
                 }
                 Err(_) => {
                     socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
@@ -1041,11 +1043,129 @@ fn cmd_attach_with_policy(name: &str, detached: bool, cmd: &[String], allow_exis
         }
     };
 
-    util::write_last_session(&cfg.socket_dir, name);
-    util::run_hook("RIFT_ON_ATTACH", &cfg.session_name);
-    let code = daemon::run_client(socket_fd);
-    util::run_hook("RIFT_ON_DETACH", &cfg.session_name);
-    code
+    attach_and_follow_switches(cfg, name.to_string(), socket_fd)
+}
+
+/// Spawn `name` in the background without attaching (used for `--detached`
+/// even from inside a session).
+fn spawn_detached(name: &str, cmd: &[String]) -> i32 {
+    let cfg = match Cfg::resolve(name) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
+    if let Err(e) = socket::ensure_dirs(&cfg.socket_dir) {
+        eprintln!("error: failed to create directories: {}", e);
+        return 1;
+    }
+    match socket::session_exists(&cfg.socket_dir, &cfg.session_name) {
+        Ok(true) => {
+            eprintln!("error: session '{}' already exists", name);
+            1
+        }
+        Ok(false) => match daemon::spawn_daemon_detached(&cfg, cmd) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                1
+            }
+        },
+        Err(e) => {
+            eprintln!("error: {}", e);
+            1
+        }
+    }
+}
+
+/// Ask the session we're currently inside (`current`) to switch the
+/// interactive user over to `target`. The daemon relays the request to its
+/// leader client, which detaches and re-attaches to `target`.
+fn request_switch(current: &str, target: &str) -> i32 {
+    // Reject an obviously invalid target up front so the user gets a clear
+    // error instead of a silently ignored request on the daemon side.
+    if let Err(e) = Cfg::resolve(target) {
+        eprintln!("error: {}", e);
+        return 1;
+    }
+    if target == current {
+        // Already here — nothing to do.
+        return 0;
+    }
+    let fd = match util::session_connect_by_name(current) {
+        Ok(fd) => fd,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
+    if let Err(e) = ipc::send(fd.as_raw_fd(), Tag::Switch, target.as_bytes()) {
+        eprintln!("error: failed to request switch: {}", e);
+        return 1;
+    }
+    0
+}
+
+/// Run the client against `fd`, and whenever the daemon tells us to switch to
+/// another session, attach to that one instead — spawning it in the session's
+/// reported cwd if it doesn't exist yet. Returns when the user finally detaches.
+fn attach_and_follow_switches(mut cfg: Cfg, mut name: String, fd: OwnedFd) -> i32 {
+    let mut fd = fd;
+    loop {
+        util::write_last_session(&cfg.socket_dir, &name);
+        util::run_hook("RIFT_ON_ATTACH", &cfg.session_name);
+        let (code, outcome) = daemon::run_client_outcome(fd);
+        util::run_hook("RIFT_ON_DETACH", &cfg.session_name);
+
+        let (next_name, cwd) = match outcome {
+            daemon::ClientOutcome::Detached => return code,
+            daemon::ClientOutcome::Switch { name, cwd } => (name, cwd),
+        };
+
+        match connect_or_spawn_for_switch(&next_name, cwd.as_deref()) {
+            Ok((next_cfg, next_fd)) => {
+                cfg = next_cfg;
+                name = next_name;
+                fd = next_fd;
+            }
+            Err(e) => {
+                eprintln!("error: switch to '{}' failed: {}", next_name, e);
+                return 1;
+            }
+        }
+    }
+}
+
+/// Resolve `name`, connect to it if it exists, otherwise spawn a fresh session
+/// rooted at `cwd` (the previous session's directory). Returns the resolved
+/// config and a connected client socket.
+fn connect_or_spawn_for_switch(name: &str, cwd: Option<&str>) -> Result<(Cfg, OwnedFd), String> {
+    let cfg = Cfg::resolve(name)?;
+    socket::ensure_dirs(&cfg.socket_dir).map_err(|e| format!("failed to create dirs: {}", e))?;
+    let path_str = cfg
+        .socket_path
+        .to_str()
+        .ok_or_else(|| "invalid socket path".to_string())?
+        .to_string();
+
+    if let Ok(true) = socket::session_exists(&cfg.socket_dir, &cfg.session_name)
+        && let Ok(fd) = socket::session_connect(&path_str)
+    {
+        return Ok((cfg, fd));
+    }
+    socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
+
+    // Spawn a new session in the previous session's cwd so the switch lands in
+    // a sensible directory. Changing our own cwd is fine: this process only
+    // forks the daemon (which inherits it) and then re-attaches.
+    if let Some(cwd) = cwd
+        && !cwd.is_empty()
+    {
+        let _ = std::env::set_current_dir(cwd);
+    }
+    let fd = daemon::spawn_daemon(&cfg, &[])?;
+    Ok((cfg, fd))
 }
 
 pub fn cmd_smart(program: &str, args: &[String], force_new: bool) -> i32 {

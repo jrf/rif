@@ -17,7 +17,7 @@ use crate::socket;
 mod client;
 mod server;
 
-pub use client::run_client;
+pub use client::{ClientOutcome, run_client_outcome};
 pub use server::{spawn_daemon, spawn_daemon_detached};
 
 // ---------------------------------------------------------------------------

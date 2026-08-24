@@ -3,7 +3,6 @@
 ## Now
 
 ## Next
-- [ ] Add in-session switching #feature
 
 ## Later
 - [ ] Publish versioned macOS/Linux release artifacts and package metadata for Homebrew, Mise, and Nix #chore
@@ -11,6 +10,7 @@
 ## Scrapped
 
 ## Done
+- [x] In-session switching — running `rift attach <target>` from inside a session no longer errors; it asks the current daemon (`Tag::Switch`) to hand the interactive leader over to `<target>`, spawning it in the session's live cwd (OSC 7, else startup dir) if it doesn't exist. Client `run_client_outcome` reports the switch and `attach_and_follow_switches` re-attaches in a loop #feature
 - [x] Replace `vt100` with an `alacritty_terminal`-backed terminal-state model (`src/term_state.rs`) that replays full styled scrollback, OSC 7 working directories, and window titles, with color-accurate HTML export; keeps the cursor, viewport, alternate-screen, resize, input-mode, synchronized-output, and scrollback corpus as acceptance tests #improvement
 - [x] Runtime parity fixes — headless `run` terminal sizing, sane `TERM` fallback, optional detach-key disablement, and side-effect-free subcommand help #bug
 - [x] Smart bare commands — `rift <command> [args...]` derives the session name from the executable, existing sessions take precedence, and `rift --new <command>` allocates `name`, `name.1`, and later suffixes #feature

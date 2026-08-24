@@ -517,6 +517,7 @@ Usage:
   rift <name-or-command> [...]  Attach existing; otherwise run a PATH command or named shell
   rift --new <command> [...]    Run command in next free basename session (name, name.1, ...)
   rift attach|a <session>       Explicit session attach/create (optional <cmd> instead of shell)
+                                Run from inside a session to switch to <session>
   rift attach -d <session>      Create session without attaching
   rift new|n <session>          Same as attach -d
   rift list|ls|l [-s|-v] [--where k=v]

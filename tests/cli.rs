@@ -428,6 +428,52 @@ fn invalid_or_reserved_labels_are_rejected_without_mutation() {
 }
 
 #[test]
+fn switch_request_relays_to_leader_client_with_cwd() {
+    let test = RiftTest::new();
+    let create = test.output(&["new", "switch-src"]);
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    test.wait_for_session("switch-src");
+
+    let socket = test.dir.join("switch-src");
+
+    // Leader client: an interactive client that claims resize leadership.
+    let mut leader = UnixStream::connect(&socket).expect("connect leader client");
+    leader
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    send_frame(&mut leader, 2, &resize_payload(24, 80)); // Tag::Resize == 2
+    std::thread::sleep(Duration::from_millis(100));
+
+    // A separate transient client asks the daemon to switch to "switch-dst".
+    let mut requester = UnixStream::connect(&socket).expect("connect switch requester");
+    send_frame(&mut requester, 11, b"switch-dst"); // Tag::Switch == 11
+
+    // The leader must receive a Switch frame carrying "switch-dst\n<cwd>".
+    // Other frames (Init, Output) may arrive first; scan past them.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut got = None;
+    while Instant::now() < deadline {
+        let (tag, payload) = read_frame(&mut leader);
+        if tag == 11 {
+            got = Some(payload);
+            break;
+        }
+    }
+    let payload = got.expect("leader did not receive Switch frame");
+    let text = String::from_utf8_lossy(&payload);
+    let (name, cwd) = text.split_once('\n').expect("payload is name\\ncwd");
+    assert_eq!(name, "switch-dst");
+    assert!(
+        cwd.starts_with('/'),
+        "cwd should be an absolute path, got {cwd:?}"
+    );
+}
+
+#[test]
 fn subcommand_help_does_not_create_sessions() {
     let test = RiftTest::new();
 

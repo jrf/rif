@@ -642,6 +642,33 @@ impl DaemonState {
                     self.rename_session(new_name);
                 }
             }
+            Tag::Switch => {
+                // A client (typically a transient `rift attach <target>` run
+                // from *inside* the session) wants the interactive user handed
+                // off to another session. Relay the target name plus this
+                // session's live cwd (`name\ncwd`) to the current leader client
+                // so it detaches from us and attaches to the target, spawning it
+                // in the right directory if it doesn't exist yet.
+                if let Ok(target) = std::str::from_utf8(&payload)
+                    && !target.is_empty()
+                    && let Some(leader) = self.leader_client_id
+                {
+                    log::info!("client {} requested switch to '{}'", id, target);
+                    let cwd = self.parser.cwd().unwrap_or_else(|| self.cwd.clone());
+                    let mut relay = Vec::with_capacity(target.len() + 1 + cwd.len());
+                    relay.extend_from_slice(target.as_bytes());
+                    relay.push(b'\n');
+                    relay.extend_from_slice(cwd.as_bytes());
+                    self.send_to(
+                        leader,
+                        DaemonFrame {
+                            tag: Tag::Switch,
+                            payload: Bytes::from(relay),
+                        },
+                    );
+                    self.remove_client(leader);
+                }
+            }
             _ => {}
         }
     }

@@ -187,7 +187,10 @@ fn try_write<T: AsRawFd>(
 // Client entry point
 // ---------------------------------------------------------------------------
 
-pub fn run_client(socket: OwnedFd) -> i32 {
+/// Run a client session against `socket`, driving raw-mode terminal I/O over
+/// the daemon connection until the user detaches or the daemon hands us off to
+/// another session. Returns `(exit_code, outcome)`.
+pub fn run_client_outcome(socket: OwnedFd) -> (i32, ClientOutcome) {
     let socket_fd = socket.as_raw_fd();
     let stdin_fd: RawFd = 0;
     let stdout_fd: RawFd = 1;
@@ -199,7 +202,7 @@ pub fn run_client(socket: OwnedFd) -> i32 {
     ] {
         if let Err(e) = socket::set_nonblock_and_cloexec(fd) {
             eprintln!("error: failed to set {} nonblock: {}", name, e);
-            return 1;
+            return (1, ClientOutcome::Detached);
         }
     }
     let _stdout_guard = NonBlockGuard { fd: stdout_fd };
@@ -209,7 +212,7 @@ pub fn run_client(socket: OwnedFd) -> i32 {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: failed to enter raw mode: {}", e);
-            return 1;
+            return (1, ClientOutcome::Detached);
         }
     };
     let _raw_guard = RawModeGuard {
@@ -231,7 +234,7 @@ pub fn run_client(socket: OwnedFd) -> i32 {
     let std_socket = unsafe { std::os::unix::net::UnixStream::from_raw_fd(socket.into_raw_fd()) };
     if let Err(e) = std_socket.set_nonblocking(true) {
         eprintln!("error: failed to set socket nonblock: {}", e);
-        return 1;
+        return (1, ClientOutcome::Detached);
     }
 
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -241,20 +244,20 @@ pub fn run_client(socket: OwnedFd) -> i32 {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("error: failed to build runtime: {}", e);
-            return 1;
+            return (1, ClientOutcome::Detached);
         }
     };
 
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async move {
+    let outcome = local.block_on(&rt, async move {
         let stream = match UnixStream::from_std(std_socket) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("error: failed to wrap socket: {}", e);
-                return;
+                return ClientOutcome::Detached;
             }
         };
-        client_async_main(stream, stdin_fd, stdout_fd).await;
+        client_async_main(stream, stdin_fd, stdout_fd).await
     });
 
     write_bytes(stdout_fd, KBD_POP);
@@ -272,10 +275,18 @@ pub fn run_client(socket: OwnedFd) -> i32 {
     // as visible junk in the next program's stdin.
     let stdin_bfd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
     let _ = termios::tcflush(stdin_bfd, FlushArg::TCIFLUSH);
-    0
+    (0, outcome)
 }
 
-async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd) {
+/// How a client run ended. `Detached` is the ordinary case (Ctrl+\, server
+/// close, EOF). `Switch` means the daemon told us to hop to another session —
+/// carrying the target name and the cwd to spawn it in if it doesn't exist.
+pub enum ClientOutcome {
+    Detached,
+    Switch { name: String, cwd: Option<String> },
+}
+
+async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd) -> ClientOutcome {
     use futures_util::{SinkExt, StreamExt};
 
     let detach_key_disabled = std::env::var_os("RIFT_NO_DETACH_KEY").is_some();
@@ -288,14 +299,14 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: failed to wrap stdin: {}", e);
-            return;
+            return ClientOutcome::Detached;
         }
     };
     let stdout_async = match AsyncFd::new(StdioFd(stdout_fd)) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: failed to wrap stdout: {}", e);
-            return;
+            return ClientOutcome::Detached;
         }
     };
 
@@ -303,7 +314,7 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: failed to register SIGWINCH: {}", e);
-            return;
+            return ClientOutcome::Detached;
         }
     };
 
@@ -323,6 +334,7 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
 
     let mut out_buf: Vec<u8> = Vec::new();
     let mut stdin_buf = [0u8; 4096];
+    let mut outcome = ClientOutcome::Detached;
 
     loop {
         let has_pending = !out_buf.is_empty();
@@ -367,6 +379,15 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
                         }
                         out_buf.extend_from_slice(&payload);
                     }
+                    Tag::Switch => {
+                        // Daemon is handing us off to another session. Payload is
+                        // `name\ncwd`; the cwd (this session's live dir) is used
+                        // to spawn the target if it doesn't exist yet.
+                        if let Some((name, cwd)) = parse_switch_payload(&payload) {
+                            outcome = ClientOutcome::Switch { name, cwd };
+                        }
+                        break;
+                    }
                     Tag::Detach => break,
                     _ => {}
                 }
@@ -400,6 +421,22 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
             _ => break,
         }
     }
+
+    outcome
+}
+
+/// Parse a `Switch` payload of the form `name` or `name\ncwd` into the target
+/// session name and optional cwd. Returns `None` when the name is empty.
+fn parse_switch_payload(payload: &[u8]) -> Option<(String, Option<String>)> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let (name, cwd) = match text.split_once('\n') {
+        Some((name, cwd)) => (name, (!cwd.is_empty()).then(|| cwd.to_string())),
+        None => (text, None),
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), cwd))
 }
 
 fn write_terminal_reset(fd: RawFd) {
@@ -424,7 +461,7 @@ fn write_bytes(fd: RawFd, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::should_detach;
+    use super::{parse_switch_payload, should_detach};
 
     #[test]
     fn detach_key_can_be_disabled() {
@@ -432,5 +469,26 @@ mod tests {
         assert!(should_detach(b"\x1b[92;5u", false));
         assert!(!should_detach(&[0x1c], true));
         assert!(!should_detach(b"\x1b[92;5u", true));
+    }
+
+    #[test]
+    fn switch_payload_splits_name_and_cwd() {
+        assert_eq!(
+            parse_switch_payload(b"work\n/home/me/project"),
+            Some(("work".to_string(), Some("/home/me/project".to_string())))
+        );
+        // Name only (no cwd).
+        assert_eq!(
+            parse_switch_payload(b"work"),
+            Some(("work".to_string(), None))
+        );
+        // Trailing newline with empty cwd yields no cwd.
+        assert_eq!(
+            parse_switch_payload(b"work\n"),
+            Some(("work".to_string(), None))
+        );
+        // Empty name is rejected.
+        assert_eq!(parse_switch_payload(b""), None);
+        assert_eq!(parse_switch_payload(b"\n/tmp"), None);
     }
 }

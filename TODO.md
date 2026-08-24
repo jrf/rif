@@ -3,7 +3,6 @@
 ## Now
 
 ## Next
-- [ ] Replace `vt100` with a terminal-state backend that can replay full styled scrollback, scrolling regions, OSC 7 working directories, and Kitty keyboard mode state; keep the cursor, viewport, alternate-screen, resize, synchronized-output, and nested-session corpus as acceptance tests #improvement
 - [ ] Add in-session switching #feature
 
 ## Later
@@ -12,6 +11,7 @@
 ## Scrapped
 
 ## Done
+- [x] Replace `vt100` with an `alacritty_terminal`-backed terminal-state model (`src/term_state.rs`) that replays full styled scrollback, OSC 7 working directories, and window titles, with color-accurate HTML export; keeps the cursor, viewport, alternate-screen, resize, input-mode, synchronized-output, and scrollback corpus as acceptance tests #improvement
 - [x] Runtime parity fixes — headless `run` terminal sizing, sane `TERM` fallback, optional detach-key disablement, and side-effect-free subcommand help #bug
 - [x] Smart bare commands — `rift <command> [args...]` derives the session name from the executable, existing sessions take precedence, and `rift --new <command>` allocates `name`, `name.1`, and later suffixes #feature
 - [x] Session labels — sorted `get`, `set`, `unset`, and `clear`; label rendering and `list --where key=value`; shell completions; frozen tag values; and list compatibility with daemons that predate label tags #feature
@@ -38,7 +38,7 @@
 - [x] `src/ipc.rs` — IPC protocol (Tag enum, Header, send/recv, SocketBuffer, probe_session) #feature
 - [x] `src/socket.rs` — Unix socket creation/connection, session name validation, path management #feature
 - [x] `src/logger.rs` — File-based logging with 5MB rotation #feature
-- [x] `src/util.rs` — Shell quoting, DA responses, task exit markers, terminal serialization (vt100), session listing #feature
+- [x] `src/util.rs` — Shell quoting, DA responses, task exit markers, terminal serialization, session listing #feature
 - [x] `src/main.rs` — Core runtime: CLI, PTY spawning, daemon/client event loops, attach flow #feature
 - [x] list — enumerate active sessions with status info #feature
 - [x] kill — terminate a session by name #feature

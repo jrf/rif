@@ -596,7 +596,17 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
         )
     };
 
-    let size = ipc::get_terminal_size(libc::STDOUT_FILENO);
+    // On the detached path there is no interactive terminal to mirror, so
+    // avoid probing (which falls back to opening /dev/tty and can pick up the
+    // launching terminal's size). Use a stable default instead.
+    let size = if detached {
+        ipc::Resize {
+            rows: 24,
+            cols: 120,
+        }
+    } else {
+        ipc::get_terminal_size(libc::STDOUT_FILENO)
+    };
     if let Err(e) = ipc::send(socket_fd.as_raw_fd(), Tag::Resize, &size.encode()) {
         eprintln!("error: failed to send terminal size: {}", e);
         return 1;

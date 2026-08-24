@@ -49,7 +49,7 @@ impl vte::Perform for UserInputDetector {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
-        if intermediates == [b'O'] && matches!(byte, b'A'..=b'D' | b'P'..=b'S') {
+        if intermediates == b"O" && matches!(byte, b'A'..=b'D' | b'P'..=b'S') {
             self.found = true;
         }
     }
@@ -663,18 +663,13 @@ fn leading_number(field: &[u8]) -> Option<u32> {
     std::str::from_utf8(&field[..end]).ok()?.parse().ok()
 }
 
-// -- Terminal serialization (vt100 crate) -------------------------------------
+// -- Terminal serialization ---------------------------------------------------
 
 /// Serialize the current terminal state for reattach.
-/// Returns the VT escape sequences needed to reproduce the screen.
-pub fn serialize_terminal_state(parser: &vt100::Parser) -> Option<Vec<u8>> {
-    let screen = parser.screen();
-    let mut data = Vec::new();
-    if screen.alternate_screen() {
-        data.extend_from_slice(b"\x1b[?1049h");
-    }
-    data.extend_from_slice(&screen.state_formatted());
-    if data.is_empty() { None } else { Some(data) }
+/// Returns the VT escape sequences needed to reproduce the screen (including
+/// scrollback for the primary screen).
+pub fn serialize_terminal_state(term: &crate::term_state::TermState) -> Option<Vec<u8>> {
+    term.serialize_state()
 }
 
 /// Force OSC 133 prompt markers to tell the outer terminal not to redraw.
@@ -723,7 +718,7 @@ pub fn rewrite_prompt_redraw(data: &[u8]) -> Option<Vec<u8>> {
                 .iter()
                 .position(|byte| *byte == b';')
                 .map_or(terminator, |offset| value_start + offset);
-            result.splice(value_start..value_end, [b'0']);
+            result.splice(value_start..value_end, *b"0");
         } else {
             result.splice(terminator..terminator, *b";redraw=0");
         }
@@ -753,51 +748,16 @@ pub enum HistoryFormat {
 }
 
 /// Serialize terminal contents in the requested format.
-pub fn serialize_terminal(parser: &vt100::Parser, format: HistoryFormat) -> Option<Vec<u8>> {
-    let screen = parser.screen();
+pub fn serialize_terminal(
+    term: &crate::term_state::TermState,
+    format: HistoryFormat,
+) -> Option<Vec<u8>> {
     let data = match format {
-        HistoryFormat::Plain => screen.contents().into_bytes(),
-        HistoryFormat::Vt => screen.contents_formatted(),
-        HistoryFormat::Html => {
-            // vt100 crate doesn't have built-in HTML export;
-            // build a simple one from cell-by-cell iteration
-            serialize_html(screen)
-        }
+        HistoryFormat::Plain => term.contents_plain(),
+        HistoryFormat::Vt => term.contents_vt(),
+        HistoryFormat::Html => term.contents_html(),
     };
     if data.is_empty() { None } else { Some(data) }
-}
-
-fn serialize_html(screen: &vt100::Screen) -> Vec<u8> {
-    let (rows, cols) = screen.size();
-    let mut html = String::new();
-    html.push_str("<pre>");
-    for row in 0..rows {
-        for col in 0..cols {
-            let cell = screen.cell(row, col);
-            if let Some(cell) = cell {
-                let ch = cell.contents();
-                if ch.is_empty() {
-                    html.push(' ');
-                } else {
-                    // Escape HTML entities
-                    for c in ch.chars() {
-                        match c {
-                            '<' => html.push_str("&lt;"),
-                            '>' => html.push_str("&gt;"),
-                            '&' => html.push_str("&amp;"),
-                            '"' => html.push_str("&quot;"),
-                            _ => html.push(c),
-                        }
-                    }
-                }
-            } else {
-                html.push(' ');
-            }
-        }
-        html.push('\n');
-    }
-    html.push_str("</pre>");
-    html.into_bytes()
 }
 
 // -- Shell detection ----------------------------------------------------------
@@ -871,45 +831,6 @@ pub fn filter_tail_output(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn terminal(rows: u16, cols: u16, data: &[u8]) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(rows, cols, 10_000);
-        parser.process(data);
-        parser
-    }
-
-    fn terminal_roundtrip(source: &vt100::Parser) -> vt100::Parser {
-        let (rows, cols) = source.screen().size();
-        let mut destination = vt100::Parser::new(rows, cols, 10_000);
-        destination.process(
-            &serialize_terminal_state(source).expect("terminal state should not be empty"),
-        );
-        destination
-    }
-
-    fn assert_visible_state_matches(expected: &vt100::Parser, actual: &vt100::Parser) {
-        assert_eq!(actual.screen().contents(), expected.screen().contents());
-        assert_eq!(
-            actual.screen().cursor_position(),
-            expected.screen().cursor_position()
-        );
-        assert_eq!(
-            actual.screen().hide_cursor(),
-            expected.screen().hide_cursor()
-        );
-        assert_eq!(
-            actual.screen().bracketed_paste(),
-            expected.screen().bracketed_paste()
-        );
-        assert_eq!(
-            actual.screen().application_cursor(),
-            expected.screen().application_cursor()
-        );
-        assert_eq!(
-            actual.screen().application_keypad(),
-            expected.screen().application_keypad()
-        );
-    }
 
     #[test]
     fn task_completion_scanner_handles_split_records() {
@@ -992,94 +913,5 @@ mod tests {
             Some(b"\x1b]133;A;aid=2;redraw=0\x1b\\".to_vec())
         );
         assert_eq!(rewrite_prompt_redraw(b"\x1b]133;A;redraw=0\x07"), None);
-    }
-
-    #[test]
-    fn terminal_state_roundtrip_preserves_positioned_content_and_modes() {
-        let source = terminal(
-            24,
-            80,
-            b"\x1b[2J\x1b[2;5HMARK_A\x1b[10;30HMARK_B\
-              \x1b[16;20H\x1b[?1h\x1b=\x1b[?25l\x1b[?2004h",
-        );
-        let destination = terminal_roundtrip(&source);
-
-        assert_visible_state_matches(&source, &destination);
-    }
-
-    #[test]
-    fn terminal_state_roundtrip_preserves_visible_content_after_scrollback() {
-        let mut source = terminal(24, 80, b"");
-        for line in 0..80 {
-            source.process(format!("SCROLL_{line}\r\n").as_bytes());
-        }
-        source.process(
-            b"\x1b[2J\x1b[2;5HMARK_A\x1b[6;15HMARK_B\
-              \x1b[10;30HMARK_C\x1b[16;20H",
-        );
-        let destination = terminal_roundtrip(&source);
-
-        assert_visible_state_matches(&source, &destination);
-    }
-
-    #[test]
-    fn terminal_state_nested_roundtrip_preserves_visible_state() {
-        let mut inner = terminal(24, 80, b"");
-        for line in 0..60 {
-            inner.process(format!("SCROLL_{line}\r\n").as_bytes());
-        }
-        inner.process(b"\x1b[2J\x1b[3;10HINNER_A\x1b[12;25HINNER_B\x1b[20;5H");
-
-        let outer = terminal_roundtrip(&inner);
-        let destination = terminal_roundtrip(&outer);
-
-        assert_visible_state_matches(&inner, &destination);
-    }
-
-    #[test]
-    fn terminal_state_roundtrip_does_not_leak_inactive_alternate_screen() {
-        let source = terminal(
-            24,
-            80,
-            b"\x1b[?1049h\x1b[2J\x1b[3;10HALT_MARK\
-              \x1b[?1049l\x1b[2J\x1b[2;5HMAIN_MARK\x1b[8;20H",
-        );
-        let destination = terminal_roundtrip(&source);
-
-        assert_visible_state_matches(&source, &destination);
-        assert!(!destination.screen().contents().contains("ALT_MARK"));
-        assert!(!destination.screen().alternate_screen());
-    }
-
-    #[test]
-    fn terminal_state_roundtrip_preserves_active_alternate_screen() {
-        let source = terminal(24, 80, b"\x1b[?1049h\x1b[2J\x1b[3;10HALT_MARK\x1b[8;20H");
-        let destination = terminal_roundtrip(&source);
-
-        assert_visible_state_matches(&source, &destination);
-        assert!(destination.screen().alternate_screen());
-    }
-
-    #[test]
-    fn terminal_state_roundtrip_after_resize_preserves_visible_state() {
-        let mut source = terminal(
-            30,
-            80,
-            b"\x1b[2J\x1b[3;10HSIZE_A\x1b[12;20HSIZE_B\
-              \x1b[20;40HSIZE_C\x1b[15;15H",
-        );
-        source.screen_mut().set_size(24, 80);
-        let destination = terminal_roundtrip(&source);
-
-        assert_visible_state_matches(&source, &destination);
-    }
-
-    #[test]
-    fn terminal_state_excludes_synchronized_output_replay() {
-        let source = terminal(24, 80, b"\x1b[?2004h\x1b[?2026hhello");
-        let serialized = serialize_terminal_state(&source).expect("terminal state");
-
-        assert!(serialized.windows(8).any(|window| window == b"\x1b[?2004h"));
-        assert!(!serialized.windows(8).any(|window| window == b"\x1b[?2026h"));
     }
 }

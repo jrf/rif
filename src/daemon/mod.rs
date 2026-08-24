@@ -2,7 +2,7 @@
 //! brokers multiple clients, plus the per-client process that proxies a
 //! local terminal to the daemon over a Unix socket.
 //!
-//! - [`server`] — the daemon-process side (forking, event loop, vt100 state).
+//! - [`server`] — the daemon-process side (forking, event loop, terminal state).
 //! - [`client`] — the client-process side (raw mode, signal/codec plumbing).
 //!
 //! Both run on a single-threaded tokio runtime (`current_thread` + `LocalSet`);

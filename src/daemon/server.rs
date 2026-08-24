@@ -1,5 +1,5 @@
 //! Daemon-process side: owns the PTY, accepts client connections, drives
-//! the vt100 parser, and brokers per-client tasks via mpsc channels.
+//! the terminal-state model, and brokers per-client tasks via mpsc channels.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -224,7 +224,7 @@ fn input_action(
 struct DaemonState {
     child_pid: libc::pid_t,
     pty_master_fd: RawFd, // owned by AsyncFd in daemon_main; held here for ioctl/write
-    parser: vt100::Parser,
+    parser: crate::term_state::TermState,
     session_name: String,
     socket_dir: std::path::PathBuf,
     shell_cmd: String,
@@ -249,6 +249,9 @@ struct DaemonState {
 
 impl DaemonState {
     fn build_info(&self) -> ipc::Info {
+        // Prefer the live cwd reported by the shell via OSC 7; fall back to the
+        // directory captured when the daemon started.
+        let cwd = self.parser.cwd().unwrap_or_else(|| self.cwd.clone());
         ipc::Info {
             clients_len: self.clients.len(),
             pid: self.child_pid,
@@ -256,7 +259,7 @@ impl DaemonState {
             task_ended_at: self.task_ended_at,
             task_exit_code: self.task_exit_code,
             cmd: self.shell_cmd.as_bytes().to_vec(),
-            cwd: self.cwd.as_bytes().to_vec(),
+            cwd: cwd.into_bytes(),
         }
     }
 
@@ -294,7 +297,7 @@ impl DaemonState {
     }
 
     fn apply_resize(&mut self, resize: ipc::Resize) {
-        self.parser.screen_mut().set_size(resize.rows, resize.cols);
+        self.parser.set_size(resize.rows, resize.cols);
         let ws = libc::winsize {
             ws_row: resize.rows,
             ws_col: resize.cols,
@@ -943,7 +946,7 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
     };
     log::info!("child spawned, pid={} cmd={}", child_pid, display_cmd);
 
-    let mut parser = vt100::Parser::new(24, 80, 1000);
+    let mut parser = crate::term_state::TermState::new(24, 80);
     if !early_output.is_empty() {
         parser.process(&early_output);
     }

@@ -5,6 +5,7 @@ mod ipc;
 mod label;
 mod logger;
 mod socket;
+mod term_state;
 mod util;
 
 use crate::util::HistoryFormat;

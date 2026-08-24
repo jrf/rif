@@ -8,7 +8,31 @@ Panes and tabs are left to your terminal emulator (WezTerm, Kitty, etc.). rift d
 
 ## Install
 
-Requires Rust (edition 2024) and [just](https://github.com/casey/just).
+### From a release (recommended)
+
+Prebuilt binaries for macOS (arm64/x86_64) and Linux (arm64/x86_64) are attached
+to every [tagged release](https://github.com/jrf/rift/releases).
+
+```bash
+# Homebrew (via tap or the bundled formula)
+brew install --formula ./packaging/homebrew/rift.rb
+
+# Mise (prebuilt binary via the ubi backend)
+mise use ubi:jrf/rift        # or: mise use cargo:rift  (build from source)
+
+# Nix flake
+nix profile install github:jrf/rift    # or: nix run github:jrf/rift
+
+# Cargo (build + install from crates/source)
+cargo install --git https://github.com/jrf/rift
+```
+
+See [`packaging/`](packaging/) for the Homebrew formula, Mise/aqua metadata, and
+the release process.
+
+### From source
+
+Requires Rust (edition 2024, ≥ 1.85) and [just](https://github.com/casey/just).
 
 ```bash
 just              # release build + install to ~/.local/bin + codesign (macOS)
@@ -172,4 +196,4 @@ This ensures that when you disconnect or lose your SSH connection, your processe
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

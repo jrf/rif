@@ -1,0 +1,20 @@
+# Mise tool configuration for installing rift.
+#
+# Drop this into a project (as `.mise.toml`) or your global config
+# (`~/.config/mise/config.toml`) and run `mise install`.
+#
+# The `ubi` backend downloads the prebuilt binary published by the release
+# workflow straight from GitHub Releases and picks the right OS/arch tarball
+# automatically (assets are named `rift-<version>-<target>.tar.gz`).
+[tools]
+"ubi:jrf/rift" = { version = "latest", exe = "rift" }
+
+# ---------------------------------------------------------------------------
+# Alternatives (pick one):
+#
+#   # Build from source with the cargo backend — no prebuilt binary needed:
+#   "cargo:rift" = "latest"
+#
+#   # Pin an exact version instead of `latest`:
+#   "ubi:jrf/rift" = { version = "0.1.0", exe = "rift" }
+# ---------------------------------------------------------------------------

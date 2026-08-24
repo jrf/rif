@@ -2,6 +2,15 @@
 name = "rift"
 version = "0.1.0"
 edition = "2024"
+description = "A terminal session daemon — like tmux, screen, or abduco, but simpler."
+authors = ["Jeffrey Fetzer <jrf@users.noreply.github.com>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/jrf/rift"
+homepage = "https://github.com/jrf/rift"
+keywords = ["tmux", "terminal", "session", "pty", "multiplexer"]
+categories = ["command-line-utilities"]
+rust-version = "1.85"
 
 [dependencies]
 base64 = "0.22"
@@ -15,3 +24,10 @@ tokio = { version = "1", default-features = false, features = ["rt", "net", "sig
 tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
 vte = "0.15"
 alacritty_terminal = "0.26.0"
+
+# Optimized release binaries for distribution: strip symbols, LTO, and
+# single-codegen-unit builds so downloaded artifacts stay small and fast.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

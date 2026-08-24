@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Save and restore WezTerm layouts of rift-attached panes.
+
+WezTerm has no native session format (unlike Kitty 0.43's save_as_session),
+so this tool reconstructs the geometry itself:
+
+  save     Enumerate panes with `wezterm cli list --format json`, keep only
+           panes whose tty is running a `rift` client, record which rift
+           session each pane is attached to plus its rectangle, and write a
+           JSON layout file.
+
+  restore  Rebuild each saved window/tab, splitting panes to match the saved
+           rectangles and running `rift attach <session>` in each. Because
+           the rift daemons kept the shells alive, every pane reconnects and
+           replays its scrollback.
+
+This mirrors scripts/kitty (cmd+shift+s / cmd+shift+r) for WezTerm users.
+Layouts live under $RIFT_DIR/wezterm (default ~/.local/state/rift/wezterm).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+
+# --------------------------------------------------------------------------
+# Paths
+# --------------------------------------------------------------------------
+def layout_dir() -> Path:
+    base = os.environ.get("RIFT_DIR") or str(Path.home() / ".local/state/rift")
+    return Path(base) / "wezterm"
+
+
+# --------------------------------------------------------------------------
+# rift session detection (WezTerm cli gives no argv, so scan the pane's tty)
+# --------------------------------------------------------------------------
+def rift_session_for_tty(tty_name: str) -> str | None:
+    """Return the rift session a pane's tty is attached to, or None.
+
+    Looks at the processes on the pane's controlling tty and extracts the
+    session name from a `rift` client command line. Recognises:
+        rift attach <name> | rift a <name>
+        rift <name>
+    Flag-only / non-session rift subcommands (list, kill, ...) are ignored.
+    """
+    if not tty_name:
+        return None
+    dev = os.path.basename(tty_name)  # /dev/ttys003 -> ttys003
+    try:
+        out = subprocess.run(
+            ["ps", "-t", dev, "-o", "args="],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+    except OSError:
+        return None
+
+    for line in out.splitlines():
+        argv = line.split()
+        if not argv:
+            continue
+        name = session_from_rift_argv(argv)
+        if name is not None:
+            return name
+    return None
+
+
+# rift subcommands that never take a bare session name as their first arg.
+_NON_SESSION_SUBCOMMANDS = {
+    "list", "ls", "l", "completions", "c", "version", "v", "help", "h",
+    "new", "n", "kill", "k", "detach", "d", "wait", "w", "last", "la",
+}
+
+
+def session_from_rift_argv(argv: list[str]) -> str | None:
+    """Extract the attached session name from a rift client command line."""
+    if not argv:
+        return None
+    if os.path.basename(argv[0]) != "rift":
+        return None
+    rest = [a for a in argv[1:] if a]
+    if not rest:
+        return None
+
+    first = rest[0]
+    if first in ("attach", "a"):
+        for a in rest[1:]:
+            if a == "-d":
+                return None  # attach -d creates without attaching
+            if not a.startswith("-"):
+                return a
+        return None
+    if first.startswith("-"):
+        return None
+    if first in _NON_SESSION_SUBCOMMANDS:
+        return None
+    # Bare `rift <name>`: only treat as a session if it isn't a PATH command
+    # being run. We can't know here, so accept it — the session either exists
+    # on restore or gets created, matching `rift <name>` semantics.
+    return first
+
+
+# --------------------------------------------------------------------------
+# cwd parsing (WezTerm reports file://host/path)
+# --------------------------------------------------------------------------
+def cwd_path(cwd_url: str) -> str | None:
+    if not cwd_url:
+        return None
+    if cwd_url.startswith("file://"):
+        parts = urlsplit(cwd_url)
+        return unquote(parts.path) or None
+    return cwd_url
+
+
+# --------------------------------------------------------------------------
+# save
+# --------------------------------------------------------------------------
+def wezterm_panes() -> list[dict]:
+    out = subprocess.run(
+        ["wezterm", "cli", "list", "--format", "json"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return json.loads(out)
+
+
+def cmd_save(args: argparse.Namespace) -> int:
+    panes = wezterm_panes()
+    rift_panes = []
+    for p in panes:
+        session = rift_session_for_tty(p.get("tty_name", ""))
+        if session is None:
+            continue
+        size = p.get("size", {})
+        rift_panes.append(
+            {
+                "window_id": p["window_id"],
+                "tab_id": p["tab_id"],
+                "session": session,
+                "cwd": cwd_path(p.get("cwd", "")),
+                "left_col": p.get("left_col", 0),
+                "top_row": p.get("top_row", 0),
+                "cols": size.get("cols", 0),
+                "rows": size.get("rows", 0),
+            }
+        )
+
+    if not rift_panes:
+        print("rift-wezterm: no rift-attached panes found", file=sys.stderr)
+        return 1
+
+    layout = {"version": 1, "panes": rift_panes}
+    dest = layout_dir() / f"{args.name}.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(layout, indent=2) + "\n")
+    windows = len({p["window_id"] for p in rift_panes})
+    print(
+        f"saved {len(rift_panes)} rift pane(s) across {windows} window(s) "
+        f"to {dest}"
+    )
+    return 0
+
+
+# --------------------------------------------------------------------------
+# restore — reconstruct the guillotine split tree from pane rectangles
+# --------------------------------------------------------------------------
+class Pane:
+    __slots__ = ("session", "cwd", "x0", "y0", "x1", "y1")
+
+    def __init__(self, d: dict):
+        self.session = d["session"]
+        self.cwd = d.get("cwd")
+        self.x0 = d["left_col"]
+        self.y0 = d["top_row"]
+        self.x1 = d["left_col"] + d["cols"]
+        self.y1 = d["top_row"] + d["rows"]
+
+
+def _split_group(panes: list[Pane]):
+    """Split a set of tiled panes with one guillotine cut.
+
+    Returns (direction, first_group, second_group) where direction is
+    "right" (vertical cut, groups side by side) or "bottom" (horizontal
+    cut, groups stacked). Returns None for a single pane.
+    """
+    if len(panes) <= 1:
+        return None
+
+    # Vertical cut: some x boundary separates a left group from a right group.
+    for boundary in sorted({p.x1 for p in panes}):
+        left = [p for p in panes if p.x1 <= boundary]
+        right = [p for p in panes if p.x0 >= boundary]
+        if left and right and len(left) + len(right) == len(panes):
+            return ("right", left, right)
+
+    # Horizontal cut.
+    for boundary in sorted({p.y1 for p in panes}):
+        top = [p for p in panes if p.y1 <= boundary]
+        bottom = [p for p in panes if p.y0 >= boundary]
+        if top and bottom and len(top) + len(bottom) == len(panes):
+            return ("bottom", top, bottom)
+
+    return None
+
+
+def build_tree(panes: list[Pane]):
+    """Return a nested tree: a Pane leaf, or (direction, ratio, left, right).
+
+    ratio is the fraction of space the *second* (right/bottom) subtree gets,
+    used as wezterm's --percent when splitting.
+    """
+    cut = _split_group(panes)
+    if cut is None:
+        return panes[0]
+    direction, first, second = cut
+    if direction == "right":
+        span = max(p.x1 for p in panes) - min(p.x0 for p in panes)
+        second_span = max(p.x1 for p in second) - min(p.x0 for p in second)
+    else:
+        span = max(p.y1 for p in panes) - min(p.y0 for p in panes)
+        second_span = max(p.y1 for p in second) - min(p.y0 for p in second)
+    ratio = second_span / span if span else 0.5
+    return (direction, ratio, build_tree(first), build_tree(second))
+
+
+def top_left_leaf(node) -> Pane:
+    while not isinstance(node, Pane):
+        node = node[2]  # first/left/top child
+    return node
+
+
+def realize(node, pane_id: str, run, dry: bool) -> None:
+    """Split `pane_id` (already running node's top-left session) to match tree."""
+    if isinstance(node, Pane):
+        return
+    direction, ratio, first, second = node
+    first_of_second = top_left_leaf(second)
+    percent = max(1, min(99, round(ratio * 100)))
+    new_pane = run(
+        split_cmd(pane_id, direction, percent, first_of_second), dry
+    )
+    realize(first, pane_id, run, dry)
+    realize(second, new_pane, run, dry)
+
+
+def split_cmd(pane_id: str, direction: str, percent: int, pane: Pane) -> list[str]:
+    cmd = [
+        "wezterm", "cli", "split-pane",
+        "--pane-id", str(pane_id),
+        f"--{direction}",
+        "--percent", str(percent),
+    ]
+    if pane.cwd:
+        cmd += ["--cwd", pane.cwd]
+    cmd += ["--", "rift", "attach", pane.session]
+    return cmd
+
+
+def spawn_cmd(pane: Pane, window_id: str | None) -> list[str]:
+    cmd = ["wezterm", "cli", "spawn"]
+    if window_id is None:
+        cmd += ["--new-window"]
+    else:
+        cmd += ["--window-id", str(window_id)]
+    if pane.cwd:
+        cmd += ["--cwd", pane.cwd]
+    cmd += ["--", "rift", "attach", pane.session]
+    return cmd
+
+
+def group_by(panes: list[dict], key: str):
+    groups: dict = {}
+    for p in panes:
+        groups.setdefault(p[key], []).append(p)
+    return groups
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    src = layout_dir() / f"{args.name}.json"
+    if not src.exists():
+        print(f"rift-wezterm: no such layout: {src}", file=sys.stderr)
+        return 1
+    layout = json.loads(src.read_text())
+    panes = layout.get("panes", [])
+    if not panes:
+        print("rift-wezterm: layout has no panes", file=sys.stderr)
+        return 1
+
+    dry = args.dry_run
+
+    def run(cmd: list[str], dry: bool) -> str:
+        if dry:
+            print(" ".join(cmd))
+            return "<pane-id>"
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+
+    for wi, (_, wpanes) in enumerate(group_by(panes, "window_id").items()):
+        window_id: str | None = None
+        for ti, (_, tpanes) in enumerate(group_by(wpanes, "tab_id").items()):
+            tree = build_tree([Pane(p) for p in tpanes])
+            first = top_left_leaf(tree)
+            if window_id is None:
+                # First tab of this window: new window (except spawn reuses
+                # the caller's window for the very first pane is fine too, but
+                # a dedicated window keeps restores self-contained).
+                pane_id = run(spawn_cmd(first, None), dry)
+                if not dry:
+                    window_id = _window_of_pane(pane_id)
+            else:
+                pane_id = run(spawn_cmd(first, window_id), dry)
+            realize(tree, pane_id, run, dry)
+
+    return 0
+
+
+def _window_of_pane(pane_id: str) -> str | None:
+    try:
+        panes = wezterm_panes()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    for p in panes:
+        if str(p.get("pane_id")) == str(pane_id):
+            return str(p.get("window_id"))
+    return None
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    d = layout_dir()
+    if not d.exists():
+        return 0
+    for f in sorted(d.glob("*.json")):
+        print(f.stem)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="rift-wezterm", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_save = sub.add_parser("save", help="save current rift panes as a layout")
+    p_save.add_argument("name", nargs="?", default="default")
+    p_save.set_defaults(func=cmd_save)
+
+    p_restore = sub.add_parser("restore", help="restore a saved layout")
+    p_restore.add_argument("name", nargs="?", default="default")
+    p_restore.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the wezterm commands instead of running them",
+    )
+    p_restore.set_defaults(func=cmd_restore)
+
+    p_list = sub.add_parser("list", help="list saved layouts")
+    p_list.set_defaults(func=cmd_list)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

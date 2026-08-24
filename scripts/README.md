@@ -21,6 +21,8 @@ its native session format.
 | `kitty/rift-snapshot.py` | Legacy converter used by `rift-snapshot`. |
 | `bash/rift-autostart.bash` | The equivalent autostart hook for remote bash. Append to the *top* of `~/.bashrc` on every host you ssh into. |
 | `bash/rift-aliases.bash` | The complete set of bash aliases and functions. |
+| `wezterm/rift-wezterm` | Save/restore WezTerm layouts of rift panes (WezTerm has no native session format). See [`wezterm/README.md`](wezterm/README.md). |
+| `wezterm/rift.lua` | WezTerm config module: `CMD+SHIFT+t/Enter/s/r` bindings for spawn and layout save/restore. |
 
 ## Install (one-time, per machine)
 

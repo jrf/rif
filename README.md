@@ -178,6 +178,22 @@ in Kitty's native session format and `cmd+shift+r` restores them.
 See [`scripts/README.md`](scripts/README.md) for the full layout, install
 commands, and daily-use table.
 
+### WezTerm layout save/restore
+
+WezTerm has no native session format, so `scripts/wezterm/rift-wezterm`
+reconstructs it: `save` records which rift session sits in each pane rectangle
+(`wezterm cli list`), and `restore` rebuilds the splits with
+`wezterm cli spawn`/`split-pane`, running `rift attach` in each pane so the
+live daemons reconnect. A `scripts/wezterm/rift.lua` config module binds
+`CMD+SHIFT+t/Enter` (new rift tab/split) and `CMD+SHIFT+s/r` (save/restore).
+
+```bash
+rift-wezterm save work        # snapshot current rift panes
+rift-wezterm restore work     # rebuild them in a new window
+```
+
+See [`scripts/wezterm/README.md`](scripts/wezterm/README.md) for details.
+
 ## Integrating with SSH Login
 
 To automatically start or connect to a default `rift` session (e.g., named "main") every time you connect to a server over SSH, you can add the following snippet to your shell configuration (`~/.bashrc`, `~/.zshrc`, or `~/.profile`):

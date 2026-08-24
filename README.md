@@ -20,9 +20,6 @@ brew install --formula ./packaging/homebrew/rift.rb
 # Mise (prebuilt binary via the ubi backend)
 mise use ubi:jrf/rift        # or: mise use cargo:rift  (build from source)
 
-# Nix flake
-nix profile install github:jrf/rift    # or: nix run github:jrf/rift
-
 # Cargo (build + install from crates/source)
 cargo install --git https://github.com/jrf/rift
 ```

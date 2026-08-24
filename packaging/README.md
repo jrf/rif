@@ -10,9 +10,6 @@ Distribution metadata and the release process for rift.
 | `mise/.mise.toml` | Mise tool config; installs the release binary via the `ubi` backend (or `cargo:` from source). |
 | `aqua/registry.yaml` | aqua-registry package definition (consumed by `mise use aqua:jrf/rift` and the aqua CLI). |
 
-The Nix flake lives at the repo root (`flake.nix`) so `nix run github:jrf/rift`
-works without a subpath.
-
 ## Release process
 
 1. Bump the version everywhere and sync `Cargo.lock`:

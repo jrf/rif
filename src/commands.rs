@@ -603,6 +603,8 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
         ipc::Resize {
             rows: 24,
             cols: 120,
+            xpixel: 0,
+            ypixel: 0,
         }
     } else {
         ipc::get_terminal_size(libc::STDOUT_FILENO)

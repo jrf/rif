@@ -85,25 +85,46 @@ pub fn decode_task_complete(payload: &[u8]) -> Option<(u64, u8)> {
 pub struct Resize {
     pub rows: u16,
     pub cols: u16,
+    /// Terminal width in pixels (ws_xpixel). 0 when the terminal doesn't report it.
+    pub xpixel: u16,
+    /// Terminal height in pixels (ws_ypixel). 0 when the terminal doesn't report it.
+    pub ypixel: u16,
 }
 
 impl Resize {
-    pub const WIRE_LEN: usize = 4;
+    /// Full wire length. Older peers emit only the first 4 bytes (rows + cols);
+    /// [`Resize::decode`] tolerates that and reports 0 pixels in that case.
+    pub const WIRE_LEN: usize = 8;
+    const MIN_WIRE_LEN: usize = 4;
 
     pub fn encode(&self) -> [u8; Self::WIRE_LEN] {
         let mut buf = [0u8; Self::WIRE_LEN];
         buf[0..2].copy_from_slice(&self.rows.to_le_bytes());
         buf[2..4].copy_from_slice(&self.cols.to_le_bytes());
+        buf[4..6].copy_from_slice(&self.xpixel.to_le_bytes());
+        buf[6..8].copy_from_slice(&self.ypixel.to_le_bytes());
         buf
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() < Self::WIRE_LEN {
+        if data.len() < Self::MIN_WIRE_LEN {
             return None;
         }
+        // Pixel dimensions were added later; a shorter payload just means the
+        // peer didn't send them, so default those fields to 0 (== unknown).
+        let (xpixel, ypixel) = if data.len() >= Self::WIRE_LEN {
+            (
+                u16::from_le_bytes([data[4], data[5]]),
+                u16::from_le_bytes([data[6], data[7]]),
+            )
+        } else {
+            (0, 0)
+        };
         Some(Resize {
             rows: u16::from_le_bytes([data[0], data[1]]),
             cols: u16::from_le_bytes([data[2], data[3]]),
+            xpixel,
+            ypixel,
         })
     }
 }
@@ -194,6 +215,8 @@ pub fn get_terminal_size(fd: RawFd) -> Resize {
     Resize {
         rows: 24,
         cols: 120,
+        xpixel: 0,
+        ypixel: 0,
     }
 }
 
@@ -204,6 +227,8 @@ fn terminal_size(fd: RawFd) -> Option<Resize> {
             .then_some(Resize {
                 rows: ws.ws_row,
                 cols: ws.ws_col,
+                xpixel: ws.ws_xpixel,
+                ypixel: ws.ws_ypixel,
             })
     }
 }
@@ -515,6 +540,34 @@ impl Encoder<(Tag, Bytes)> for RiftCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_roundtrips_pixel_dimensions() {
+        let r = Resize {
+            rows: 40,
+            cols: 120,
+            xpixel: 1920,
+            ypixel: 1080,
+        };
+        let decoded = Resize::decode(&r.encode()).expect("valid resize payload");
+        assert_eq!(decoded.rows, 40);
+        assert_eq!(decoded.cols, 120);
+        assert_eq!(decoded.xpixel, 1920);
+        assert_eq!(decoded.ypixel, 1080);
+    }
+
+    #[test]
+    fn resize_decodes_legacy_4byte_payload_with_zero_pixels() {
+        // A pre-pixel peer sends only rows + cols; pixel fields default to 0.
+        let mut legacy = [0u8; 4];
+        legacy[0..2].copy_from_slice(&40u16.to_le_bytes());
+        legacy[2..4].copy_from_slice(&120u16.to_le_bytes());
+        let decoded = Resize::decode(&legacy).expect("legacy resize payload");
+        assert_eq!(decoded.rows, 40);
+        assert_eq!(decoded.cols, 120);
+        assert_eq!(decoded.xpixel, 0);
+        assert_eq!(decoded.ypixel, 0);
+    }
 
     #[test]
     fn protocol_tag_values_and_info_header_are_frozen() {

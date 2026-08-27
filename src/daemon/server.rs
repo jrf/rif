@@ -301,8 +301,12 @@ impl DaemonState {
         let ws = libc::winsize {
             ws_row: resize.rows,
             ws_col: resize.cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            // Forward the client's reported pixel dimensions so graphical
+            // programs in the session (Kitty/sixel image viewers, etc.) can
+            // compute cell pixel sizes. 0 means the client's terminal didn't
+            // report them.
+            ws_xpixel: resize.xpixel,
+            ws_ypixel: resize.ypixel,
         };
         unsafe {
             libc::ioctl(self.pty_master_fd, libc::TIOCSWINSZ, &ws);

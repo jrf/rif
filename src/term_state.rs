@@ -210,6 +210,50 @@ impl TermState {
             out.extend_from_slice(b"\x1b[?2004h");
         }
 
+        // Restore mouse tracking. This matters because the client blanket-
+        // disables every mouse mode at attach (`TERMINAL_RESET` in
+        // `daemon/client.rs`) to clear modes a *previous* session left sticky on
+        // the local terminal. Without re-enabling them here, reattaching to a
+        // session running a mouse-aware program (vim, fzf, less, a pager) left
+        // that program blind to the mouse: the inner program still believed it
+        // had tracking on — so it never re-sent the enable — while the actual
+        // terminal had it off. Clicks and wheel events then fell through to the
+        // emulator, which is why "scrolling stopped working after reattach".
+        //
+        // Order matters: the tracking mode (1000/1002/1003) is emitted before
+        // the encoding (1006/1005/1015), matching how applications enable them,
+        // since some terminals reset the encoding when the mode changes.
+        for (flag, seq) in [
+            (
+                alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK,
+                &b"\x1b[?1000h"[..],
+            ),
+            (
+                alacritty_terminal::term::TermMode::MOUSE_DRAG,
+                &b"\x1b[?1002h"[..],
+            ),
+            (
+                alacritty_terminal::term::TermMode::MOUSE_MOTION,
+                &b"\x1b[?1003h"[..],
+            ),
+            (
+                alacritty_terminal::term::TermMode::UTF8_MOUSE,
+                &b"\x1b[?1005h"[..],
+            ),
+            (
+                alacritty_terminal::term::TermMode::SGR_MOUSE,
+                &b"\x1b[?1006h"[..],
+            ),
+            (
+                alacritty_terminal::term::TermMode::FOCUS_IN_OUT,
+                &b"\x1b[?1004h"[..],
+            ),
+        ] {
+            if mode.contains(flag) {
+                out.extend_from_slice(seq);
+            }
+        }
+
         // Restore the window title (OSC 2) and working directory (OSC 7) so a
         // reattaching terminal shows the same tab title / cwd as the original.
         let title = self.title.borrow();
@@ -839,6 +883,57 @@ mod tests {
         assert!(mode.contains(TermMode::APP_KEYPAD));
         assert!(mode.contains(TermMode::BRACKETED_PASTE));
         assert!(!mode.contains(TermMode::SHOW_CURSOR));
+    }
+
+    #[test]
+    fn roundtrip_preserves_mouse_tracking_modes() {
+        // A mouse-aware program (vim, fzf, less) inside the session enables
+        // tracking. The client blanket-disables every mouse mode at attach to
+        // scrub state a previous session left sticky, so the replay is the only
+        // thing that can put it back — the inner program still thinks tracking
+        // is on and will never re-send the enable. If this regresses, the mouse
+        // (including the wheel) silently stops reaching the program after a
+        // reattach.
+        use alacritty_terminal::term::TermMode;
+        let source = terminal(24, 80, b"content\x1b[?1002h\x1b[?1006h");
+        let state = source.serialize_state().expect("state");
+        let s = String::from_utf8_lossy(&state);
+        assert!(
+            s.contains("\x1b[?1002h"),
+            "button-event tracking should be replayed, got: {s:?}"
+        );
+        assert!(
+            s.contains("\x1b[?1006h"),
+            "SGR mouse encoding should be replayed, got: {s:?}"
+        );
+        // The tracking mode must precede the encoding: some terminals reset the
+        // encoding when the tracking mode changes.
+        assert!(
+            s.find("\x1b[?1002h") < s.find("\x1b[?1006h"),
+            "tracking mode should be emitted before the encoding"
+        );
+
+        let dest = roundtrip(&source);
+        let mode = dest.term.mode();
+        assert!(
+            mode.contains(TermMode::MOUSE_DRAG),
+            "receiver should have button-event tracking on"
+        );
+        assert!(
+            mode.contains(TermMode::SGR_MOUSE),
+            "receiver should have SGR mouse encoding on"
+        );
+
+        // A session with no mouse activity must not gain tracking: emitting it
+        // unconditionally would break wheel-scrolling in plain shells, which is
+        // the exact symptom this fix is meant to cure.
+        let plain = terminal(24, 80, b"just text");
+        let plain_state = plain.serialize_state().expect("state");
+        let p = String::from_utf8_lossy(&plain_state);
+        assert!(
+            !p.contains("\x1b[?1002h") && !p.contains("\x1b[?1006h"),
+            "a mouseless session must not enable tracking, got: {p:?}"
+        );
     }
 
     #[test]

@@ -32,6 +32,9 @@ pub enum Tag {
     LabelSet = 19,
     LabelClear = 20,
     LabelData = 21,
+    EnvSet = 22,
+    EnvGet = 23,
+    EnvData = 24,
 }
 
 impl Tag {
@@ -57,6 +60,9 @@ impl Tag {
             19 => Some(Tag::LabelSet),
             20 => Some(Tag::LabelClear),
             21 => Some(Tag::LabelData),
+            22 => Some(Tag::EnvSet),
+            23 => Some(Tag::EnvGet),
+            24 => Some(Tag::EnvData),
             _ => None,
         }
     }
@@ -592,6 +598,9 @@ mod tests {
             (Tag::LabelSet, 19),
             (Tag::LabelClear, 20),
             (Tag::LabelData, 21),
+            (Tag::EnvSet, 22),
+            (Tag::EnvGet, 23),
+            (Tag::EnvData, 24),
         ];
         for (tag, expected) in tags {
             assert_eq!(tag as u8, expected);

@@ -238,6 +238,7 @@ struct DaemonState {
     client_sizes: HashMap<u64, ipc::Resize>,
     leader_client_id: Option<u64>,
     labels: BTreeMap<String, String>,
+    client_envs: HashMap<u64, String>,
     pending_runs: HashMap<u64, u64>,
     task_scan_carry: Vec<u8>,
     next_client_id: u64,
@@ -289,6 +290,7 @@ impl DaemonState {
 
     fn remove_client(&mut self, id: u64) -> bool {
         self.client_sizes.remove(&id);
+        self.client_envs.remove(&id);
         if self.leader_client_id == Some(id) {
             self.leader_client_id = None;
             log::info!("interactive leader disconnected, id={}", id);
@@ -639,6 +641,43 @@ impl DaemonState {
                     );
                 }
             }
+            Tag::EnvSet => {
+                // A client reported its tracked environment snapshot. Keep it
+                // keyed by client id so `print-env` can read the leader's.
+                match std::str::from_utf8(&payload) {
+                    Ok(env) if !env.is_empty() => {
+                        self.client_envs.insert(id, env.to_string());
+                    }
+                    _ => {
+                        self.client_envs.remove(&id);
+                    }
+                }
+            }
+            Tag::EnvGet => {
+                // Report the leader client's environment (the interactive
+                // session's). Fall back to a lone client's snapshot when no
+                // leader has claimed input yet, so `print-env` right after
+                // attach still works. Empty if nothing is attached.
+                let payload = self
+                    .leader_client_id
+                    .and_then(|leader| self.client_envs.get(&leader))
+                    .or_else(|| {
+                        if self.client_envs.len() == 1 {
+                            self.client_envs.values().next()
+                        } else {
+                            None
+                        }
+                    })
+                    .cloned()
+                    .unwrap_or_default();
+                self.send_to(
+                    id,
+                    DaemonFrame {
+                        tag: Tag::EnvData,
+                        payload: Bytes::from(payload.into_bytes()),
+                    },
+                );
+            }
             Tag::Rename => {
                 if let Ok(new_name) = std::str::from_utf8(&payload)
                     && !new_name.is_empty()
@@ -918,7 +957,7 @@ async fn daemon_main(mut state: DaemonState, listener: UnixListener, pty_master:
 // Process-level entry points
 // ---------------------------------------------------------------------------
 
-fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
+fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String], initial_labels: &[String]) {
     ignore_signal(Signal::SIGPIPE);
 
     if let Ok(ssh_auth_sock) = std::env::var("SSH_AUTH_SOCK") {
@@ -982,6 +1021,22 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
         parser.process(&early_output);
     }
 
+    // Apply any create-time labels (from `attach --labels`) atomically before
+    // the daemon serves clients, so a label filter never sees the session
+    // unlabeled. Malformed pairs are ignored here — the CLI validates first.
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
+    for group in initial_labels {
+        for pair in group.split_whitespace() {
+            if let Ok((key, value)) = crate::label::parse_pair(pair) {
+                if value.is_empty() {
+                    labels.remove(key);
+                } else {
+                    labels.insert(key.to_string(), value.to_string());
+                }
+            }
+        }
+    }
+
     let state = DaemonState {
         child_pid,
         pty_master_fd: master_fd,
@@ -998,7 +1053,8 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
         clients: HashMap::new(),
         client_sizes: HashMap::new(),
         leader_client_id: None,
-        labels: BTreeMap::new(),
+        labels,
+        client_envs: HashMap::new(),
         pending_runs: HashMap::new(),
         task_scan_carry: Vec::new(),
         next_client_id: 0,
@@ -1044,12 +1100,13 @@ fn run_daemon(cfg: &Cfg, server_fd: RawFd, cmd: &[String]) {
     log::info!("daemon exiting, session={}", session_name);
 }
 
-fn fork_daemon(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
+fn fork_daemon(cfg: &Cfg, cmd: &[String], labels: &[String]) -> Result<(), String> {
     let server_owned = socket::create_socket(&cfg.socket_path)
         .map_err(|e| format!("failed to create socket: {}", e))?;
     let server_fd = server_owned.into_raw_fd();
 
     let cmd_owned: Vec<String> = cmd.to_vec();
+    let labels_owned: Vec<String> = labels.to_vec();
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         unsafe {
@@ -1064,7 +1121,7 @@ fn fork_daemon(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
             libc::setsid();
         }
         redirect_std_to_devnull();
-        run_daemon(cfg, server_fd, &cmd_owned);
+        run_daemon(cfg, server_fd, &cmd_owned, &labels_owned);
         unsafe {
             libc::_exit(0);
         }
@@ -1076,8 +1133,8 @@ fn fork_daemon(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn spawn_daemon(cfg: &Cfg, cmd: &[String]) -> Result<OwnedFd, String> {
-    fork_daemon(cfg, cmd)?;
+pub fn spawn_daemon(cfg: &Cfg, cmd: &[String], labels: &[String]) -> Result<OwnedFd, String> {
+    fork_daemon(cfg, cmd, labels)?;
 
     let path_str = cfg.socket_path.to_str().ok_or("invalid socket path")?;
 
@@ -1093,8 +1150,8 @@ pub fn spawn_daemon(cfg: &Cfg, cmd: &[String]) -> Result<OwnedFd, String> {
     unreachable!()
 }
 
-pub fn spawn_daemon_detached(cfg: &Cfg, cmd: &[String]) -> Result<(), String> {
-    fork_daemon(cfg, cmd)?;
+pub fn spawn_daemon_detached(cfg: &Cfg, cmd: &[String], labels: &[String]) -> Result<(), String> {
+    fork_daemon(cfg, cmd, labels)?;
     println!("session '{}' created", cfg.session_name);
     Ok(())
 }

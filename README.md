@@ -46,6 +46,7 @@ rift <name-or-command> [...]  Attach existing; otherwise run a PATH command or n
 rift --new <command> [...]    Run command in next free basename session (name, name.1, ...)
 rift attach <session>         Explicitly attach to (or create) a shell session
 rift attach -d <session>      Create session without attaching
+rift attach --labels "k=v ..." <session>  Attach/create with labels set atomically
 rift new <session>            Same as attach -d
 rift list [-s|-v] [--where k=v] List sessions, optionally filtered by label
 rift get <session> [key]      Get all labels or one label value
@@ -60,6 +61,7 @@ rift tail <name>...           Follow session output in real-time
 rift history <session>        Print session output (--vt, --html)
 rift logs <session> [...]     Tail -f the session log file (extra args pass to tail)
 rift last                     Attach to the most recently attached session
+rift print-env [-s] <session> [key]  Print the leader client's tracked env vars (-s: export/unset)
 rift detach [<session>]       Detach all clients (uses $RIFT_SESSION if no arg)
 rift rename [<old_name>] <new_name> Rename a session (defaults to $RIFT_SESSION)
 rift kill <name>... [-f]      Kill sessions (-f for SIGKILL)
@@ -67,7 +69,7 @@ rift wait <name>...           Wait for sessions to complete
 rift completions <shell>      Print completions (bash, zsh, fish, nu)
 ```
 
-All subcommands have short aliases: `a`, `n`, `r`, `s`, `p`, `wr`, `t`, `hi`, `lg`, `la`, `d`, `rn`, `k`, `w`, `l`/`ls`, `c`, `v`, `h`.
+All subcommands have short aliases: `a`, `n`, `r`, `s`, `p`, `wr`, `t`, `hi`, `lg`, `la`, `pe`, `d`, `rn`, `k`, `w`, `l`/`ls`, `c`, `v`, `h`.
 
 **Detach key:** `Ctrl+\`
 
@@ -127,6 +129,7 @@ same-named executable.
 | `RIFT_EMPTY_TIMEOUT` | Idle duration (in seconds) after which a detached session with 0 clients will automatically terminate (e.g., `3600` for 1 hour) |
 | `RIFT_NO_DETACH_KEY` | Disable the `Ctrl+\` detach shortcut when set; detach by closing the terminal or running `rift detach` |
 | `RIFT_PICKER` | Shell command to use as session picker when `rift` is run with no args (e.g., `fzf`); receives session names on stdin, must print selection on stdout. Default: built-in numbered prompt. |
+| `RIFT_TRACK_ENV` | Comma-separated list of environment variables an attaching client reports to the daemon for `rift print-env`. Default: `DISPLAY,SSH_AUTH_SOCK,SSH_AGENT_PID,SSH_CONNECTION,WINDOWID,XAUTHORITY,KITTY_LISTEN_ON,KITTY_PID,KITTY_WINDOW_ID` |
 | `RIFT_ON_ATTACH` | Shell snippet run when a client attaches (fire-and-forget, stdio detached). `$RIFT_SESSION` is set and the session name is also passed as `$1`. |
 | `RIFT_ON_DETACH` | Shell snippet run when a client detaches. Same context as `RIFT_ON_ATTACH`. |
 | `RIFT_ON_EXIT` | Shell snippet run when the session's shell exits and the daemon tears down. Inherits the env present when the daemon was first spawned. |
@@ -136,6 +139,26 @@ same-named executable.
 When attaching to a session from multiple SSH connections or after reconnecting, `rift` automatically and dynamically updates your `SSH_AUTH_SOCK` pointer. 
 
 When the session is spawned, `rift` configures the shell's `SSH_AUTH_SOCK` to point to a stable symlink in your socket directory (`<socket_dir>/<session_name>.ssh-auth-sock`). Whenever a new `rift` client attaches, it sends its current SSH agent socket, and the daemon updates this symlink to point to the active agent. This allows commands (like `git push`) inside your persistent shell to seamlessly use your active SSH keys.
+
+## Tracked Environment (`print-env`)
+
+When a client attaches, it sends the daemon a snapshot of a small set of
+environment variables — by default the display/SSH/terminal integration vars
+`DISPLAY`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `SSH_CONNECTION`, `WINDOWID`,
+`XAUTHORITY`, `KITTY_LISTEN_ON`, `KITTY_PID`, `KITTY_WINDOW_ID` (override the
+list with `RIFT_TRACK_ENV`). The daemon keeps the interactive leader client's
+snapshot so tools running *inside* the session can recover the current
+terminal/GUI context after a reconnect:
+
+```bash
+rift print-env dev                 # KEY=VALUE lines (VALUE absent -> "-KEY")
+rift print-env dev DISPLAY         # just one value (exit 1 if unset/absent)
+eval "$(rift print-env -s dev)"    # re-export into the current shell
+```
+
+This mirrors reconnecting `SSH_AUTH_SOCK` above, but generalised: after moving
+your session to a new terminal, `eval "$(rift print-env -s "$RIFT_SESSION")"`
+refreshes `DISPLAY`/`KITTY_WINDOW_ID`/etc. for long-lived programs.
 
 ## Architecture
 

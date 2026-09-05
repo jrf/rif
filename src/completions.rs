@@ -17,7 +17,7 @@ const BASH: &str = r#"_rift_completions() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-  local commands="--new attach new run send print write tail detach list get set unset clear completions kill history wait version help rename rn logs lg last la"
+  local commands="--new attach new run send print write tail detach list get set unset clear completions kill history wait version help rename rn logs lg last la print-env pe"
 
   if [[ $COMP_CWORD -eq 1 ]]; then
     local sessions=$(rift list --short 2>/dev/null | tr '\n' ' ')
@@ -29,7 +29,7 @@ const BASH: &str = r#"_rift_completions() {
     --new)
       COMPREPLY=($(compgen -c -- "$cur"))
       ;;
-    attach|a|new|n|run|r|send|s|print|p|write|wr|tail|t|kill|k|history|hi|detach|d|wait|w|rename|rn|logs|lg|get|g|set|unset|un|clear|cl)
+    attach|a|new|n|run|r|send|s|print|p|write|wr|tail|t|kill|k|history|hi|detach|d|wait|w|rename|rn|logs|lg|get|g|set|unset|un|clear|cl|print-env|pe)
       local sessions=$(rift list --short 2>/dev/null | tr '\n' ' ')
       COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
       ;;
@@ -81,6 +81,7 @@ const ZSH: &str = r#"_rift() {
         'history:Print session output'
         'logs:Tail -f the session log file'
         'last:Attach to the most recently attached session'
+        'print-env:Print the leader client'\''s tracked env vars'
         'wait:Wait for sessions to complete'
         'version:Print version'
         'help:Print help'
@@ -90,7 +91,7 @@ const ZSH: &str = r#"_rift() {
       ;;
     args)
       case $words[2] in
-        attach|a|new|n|kill|k|run|r|send|s|print|p|write|wr|tail|t|detach|d|history|hi|wait|w|rename|rn|logs|lg|get|g|set|unset|un|clear|cl)
+        attach|a|new|n|kill|k|run|r|send|s|print|p|write|wr|tail|t|detach|d|history|hi|wait|w|rename|rn|logs|lg|get|g|set|unset|un|clear|cl|print-env|pe)
           _rift_sessions
           ;;
         completions)
@@ -143,6 +144,7 @@ complete -c rift -n "__fish_is_nth_token 1" -a 'k kill' -d 'Kill a session'
 complete -c rift -n "__fish_is_nth_token 1" -a 'hi history' -d 'Print session output'
 complete -c rift -n "__fish_is_nth_token 1" -a 'lg logs' -d 'Tail -f the session log file'
 complete -c rift -n "__fish_is_nth_token 1" -a 'la last' -d 'Attach to the most recently attached session'
+complete -c rift -n "__fish_is_nth_token 1" -a 'pe print-env' -d 'Print the leader client tracked env vars'
 complete -c rift -n "__fish_is_nth_token 1" -a 'w wait' -d 'Wait for sessions to complete'
 complete -c rift -n "__fish_is_nth_token 1" -a 'v version' -d 'Print version'
 complete -c rift -s V -l version -d 'Print version'
@@ -150,7 +152,7 @@ complete -c rift -n "__fish_is_nth_token 1" -a 'h help' -d 'Print help'
 complete -c rift -s h -d 'Print help'
 complete -c rift -n "__fish_is_nth_token 1" -a '(__fish_complete_command)' -d 'Command'
 
-complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr tail t kill k detach d history hi wait w rename rn logs lg get g set unset un clear cl" -a '(rift list --short 2>/dev/null)' -d 'Session name'
+complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from attach a new n run r send s print p write wr tail t kill k detach d history hi wait w rename rn logs lg get g set unset un clear cl print-env pe" -a '(rift list --short 2>/dev/null)' -d 'Session name'
 
 complete -c rift -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from completions c" -a 'bash zsh fish nu' -d Shell
 
@@ -160,6 +162,8 @@ complete -c rift -n "__fish_seen_subcommand_from list ls l" -l where -r -d 'Filt
 complete -c rift -n "__fish_seen_subcommand_from history hi" -l vt -d 'VT escape sequence format'
 complete -c rift -n "__fish_seen_subcommand_from history hi" -l html -d 'HTML format'
 complete -c rift -n "__fish_seen_subcommand_from attach a" -s d -l detached -d 'Create without attaching'
+complete -c rift -n "__fish_seen_subcommand_from attach a new n" -l labels -r -d 'Set labels at creation (k=v ...)'
+complete -c rift -n "__fish_seen_subcommand_from print-env pe" -s s -l shell -d 'Emit export/unset for eval'
 complete -c rift -n "__fish_seen_subcommand_from run r" -s d -l detached -d 'Run detached (background)'
 complete -c rift -n "__fish_seen_subcommand_from run r" -l fish -d 'Use fish shell completion detection'
 complete -c rift -n "__fish_seen_subcommand_from kill k" -s f -l force -d 'Force kill (SIGKILL)'
@@ -181,11 +185,13 @@ export extern rift [
 export extern "rift attach" [
   name: string@"nu-complete rift sessions"
   -d
+  --labels: string
   ...rest: string
 ]
 
 export extern "rift new" [
   name: string
+  --labels: string
   ...rest: string
 ]
 
@@ -228,6 +234,7 @@ export extern "rift tail" [...names: string@"nu-complete rift sessions"]
 export extern "rift logs" [name: string@"nu-complete rift sessions", ...rest: string]
 export extern "rift rename" [name?: string@"nu-complete rift sessions", new_name: string]
 export extern "rift last" []
+export extern "rift print-env" [name?: string@"nu-complete rift sessions", key?: string, --shell(-s)]
 export extern "rift version" []
 export extern "rift completions" [shell: string@"nu-complete rift shells"]
 export extern "rift help" []

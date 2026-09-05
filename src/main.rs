@@ -1,6 +1,7 @@
 mod commands;
 mod completions;
 mod daemon;
+mod env;
 mod ipc;
 mod label;
 mod logger;
@@ -25,6 +26,7 @@ enum Command {
         name: String,
         detached: bool,
         cmd: Vec<String>,
+        labels: Vec<String>,
     },
     List {
         short: bool,
@@ -92,29 +94,57 @@ enum Command {
         name: String,
         extra: Vec<String>,
     },
+    PrintEnv {
+        name: String,
+        key: Option<String>,
+        shell: bool,
+    },
     Last,
     Pick,
     Version,
     Help,
 }
 
+/// Parsed result of a `<flags> <session> <command...>` invocation.
+#[derive(Debug, PartialEq, Eq)]
+struct SessionCommand {
+    name: String,
+    cmd: Vec<String>,
+    detached: bool,
+    fish: bool,
+    labels: Vec<String>,
+}
+
 fn parse_session_command(
     args: &[String],
     allow_detached: bool,
     allow_fish: bool,
-) -> Result<(String, Vec<String>, bool, bool), String> {
+    allow_labels: bool,
+) -> Result<SessionCommand, String> {
     let mut detached = false;
     let mut fish = false;
+    let mut labels: Vec<String> = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
-        match args[index].as_str() {
+        let arg = args[index].as_str();
+        match arg {
             "--" => {
                 index += 1;
                 break;
             }
             "-d" | "--detached" if allow_detached => detached = true,
             "--fish" if allow_fish => fish = true,
+            "--labels" if allow_labels => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--labels requires a value (e.g. \"k=v k2=v2\")".to_string());
+                };
+                labels.push(value.clone());
+                index += 1;
+            }
+            _ if allow_labels && arg.starts_with("--labels=") => {
+                labels.push(arg["--labels=".len()..].to_string());
+            }
             option if option.starts_with('-') => {
                 return Err(format!("unknown option '{}'", option));
             }
@@ -126,7 +156,13 @@ fn parse_session_command(
     let Some(name) = args.get(index) else {
         return Err("session name required".to_string());
     };
-    Ok((name.clone(), args[index + 1..].to_vec(), detached, fish))
+    Ok(SessionCommand {
+        name: name.clone(),
+        cmd: args[index + 1..].to_vec(),
+        detached,
+        fish,
+        labels,
+    })
 }
 
 fn parse_args() -> Command {
@@ -244,16 +280,16 @@ fn parse_args_from(args: Vec<String>) -> Command {
             Command::Detach { name }
         }
         "run" | "r" => {
-            let (name, cmd, detached, fish) = parse_session_command(&args[1..], true, true)
-                .unwrap_or_else(|error| {
+            let parsed =
+                parse_session_command(&args[1..], true, true, false).unwrap_or_else(|error| {
                     eprintln!("error: run {}", error);
                     std::process::exit(1);
                 });
             Command::Run {
-                name,
-                cmd,
-                detached,
-                fish,
+                name: parsed.name,
+                cmd: parsed.cmd,
+                detached: parsed.detached,
+                fish: parsed.fish,
             }
         }
         "send" | "s" => {
@@ -351,28 +387,49 @@ fn parse_args_from(args: Vec<String>) -> Command {
             Command::Logs { name, extra }
         }
         "last" | "la" => Command::Last,
+        "print-env" | "pe" => {
+            let mut name: Option<String> = None;
+            let mut key: Option<String> = None;
+            let mut shell = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "-s" | "--shell" => shell = true,
+                    _ if name.is_none() => name = Some(arg.clone()),
+                    _ if key.is_none() => key = Some(arg.clone()),
+                    _ => {}
+                }
+            }
+            let name = name.unwrap_or_else(socket::session_name_from_env);
+            if name.is_empty() {
+                eprintln!("error: print-env requires a session name");
+                std::process::exit(1);
+            }
+            Command::PrintEnv { name, key, shell }
+        }
         "new" | "n" => {
-            let (name, cmd, _, _) =
-                parse_session_command(&args[1..], false, false).unwrap_or_else(|error| {
+            let parsed =
+                parse_session_command(&args[1..], false, false, true).unwrap_or_else(|error| {
                     eprintln!("error: new {}", error);
                     std::process::exit(1);
                 });
             Command::Attach {
-                name,
+                name: parsed.name,
                 detached: true,
-                cmd,
+                cmd: parsed.cmd,
+                labels: parsed.labels,
             }
         }
         "attach" | "a" => {
-            let (name, cmd, detached, _) = parse_session_command(&args[1..], true, false)
-                .unwrap_or_else(|error| {
+            let parsed =
+                parse_session_command(&args[1..], true, false, true).unwrap_or_else(|error| {
                     eprintln!("error: attach {}", error);
                     std::process::exit(1);
                 });
             Command::Attach {
-                name,
-                detached,
-                cmd,
+                name: parsed.name,
+                detached: parsed.detached,
+                cmd: parsed.cmd,
+                labels: parsed.labels,
             }
         }
         program => {
@@ -435,6 +492,8 @@ fn is_subcommand(arg: &str) -> bool {
             | "c"
             | "logs"
             | "lg"
+            | "print-env"
+            | "pe"
             | "last"
             | "la"
             | "version"
@@ -496,13 +555,17 @@ fn main() {
             0
         }
         Command::Logs { name, extra } => commands::cmd_logs(&name, &extra),
+        Command::PrintEnv { name, key, shell } => {
+            commands::cmd_print_env(&name, key.as_deref(), shell)
+        }
         Command::Last => commands::cmd_last(),
         Command::Pick => commands::cmd_pick(),
         Command::Attach {
             name,
             detached,
             cmd,
-        } => commands::cmd_attach(&name, detached, &cmd),
+            labels,
+        } => commands::cmd_attach(&name, detached, &cmd, &labels),
     };
     std::process::exit(code);
 }
@@ -519,6 +582,7 @@ Usage:
   rift attach|a <session>       Explicit session attach/create (optional <cmd> instead of shell)
                                 Run from inside a session to switch to <session>
   rift attach -d <session>      Create session without attaching
+  rift attach --labels \"k=v ...\" <session>  Attach/create with labels set atomically
   rift new|n <session>          Same as attach -d
   rift list|ls|l [-s|-v] [--where k=v]
                                 List sessions, optionally filtered by label
@@ -533,6 +597,7 @@ Usage:
   rift tail|t <name>...         Follow session output in real-time
   rift history|hi <session>     Print session output (--vt, --html)
   rift logs|lg <session> [...]  Tail -f the session log file (extra args pass to tail)
+  rift print-env|pe [-s] <session> [key]  Print the leader client's tracked env vars
   rift last|la                  Attach to the most recently attached session
   rift detach|d [<session>]     Detach all clients from a session
   rift rename|rn [<old_name>] <new_name> Rename a session (defaults to $RIFT_SESSION)
@@ -560,9 +625,16 @@ mod tests {
             parse_session_command(
                 &strings(&["-d", "--fish", "build", "cargo", "test"]),
                 true,
-                true
+                true,
+                false,
             ),
-            Ok(("build".to_string(), strings(&["cargo", "test"]), true, true))
+            Ok(SessionCommand {
+                name: "build".to_string(),
+                cmd: strings(&["cargo", "test"]),
+                detached: true,
+                fish: true,
+                labels: Vec::new(),
+            })
         );
     }
 
@@ -572,22 +644,66 @@ mod tests {
             parse_session_command(
                 &strings(&["build", "cargo", "test", "--release", "-p", "rift"]),
                 true,
-                true
-            ),
-            Ok((
-                "build".to_string(),
-                strings(&["cargo", "test", "--release", "-p", "rift"]),
+                true,
                 false,
-                false
-            ))
+            ),
+            Ok(SessionCommand {
+                name: "build".to_string(),
+                cmd: strings(&["cargo", "test", "--release", "-p", "rift"]),
+                detached: false,
+                fish: false,
+                labels: Vec::new(),
+            })
         );
     }
 
     #[test]
     fn option_separator_allows_dash_prefixed_session_name_to_reach_validation() {
         assert_eq!(
-            parse_session_command(&strings(&["--", "-session", "command"]), true, false),
-            Ok(("-session".to_string(), strings(&["command"]), false, false))
+            parse_session_command(&strings(&["--", "-session", "command"]), true, false, false),
+            Ok(SessionCommand {
+                name: "-session".to_string(),
+                cmd: strings(&["command"]),
+                detached: false,
+                fish: false,
+                labels: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn attach_labels_flag_is_collected_before_the_session() {
+        assert_eq!(
+            parse_session_command(
+                &strings(&["--labels", "project=rift env=dev", "dev"]),
+                true,
+                false,
+                true,
+            ),
+            Ok(SessionCommand {
+                name: "dev".to_string(),
+                cmd: Vec::new(),
+                detached: false,
+                fish: false,
+                labels: strings(&["project=rift env=dev"]),
+            })
+        );
+        // --labels=<value> form.
+        assert_eq!(
+            parse_session_command(&strings(&["--labels=team=core", "dev"]), true, false, true),
+            Ok(SessionCommand {
+                name: "dev".to_string(),
+                cmd: Vec::new(),
+                detached: false,
+                fish: false,
+                labels: strings(&["team=core"]),
+            })
+        );
+        // Missing value is an error.
+        assert!(parse_session_command(&strings(&["--labels"]), true, false, true).is_err());
+        // Not allowed for `run`.
+        assert!(
+            parse_session_command(&strings(&["--labels", "a=b", "s"]), true, true, false).is_err()
         );
     }
 

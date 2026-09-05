@@ -331,6 +331,14 @@ async fn client_async_main(stream: UnixStream, stdin_fd: RawFd, stdout_fd: RawFd
             ))
             .await;
     }
+    // Send the tracked-environment snapshot so `rift print-env` can report the
+    // environment this (leader) client is running under.
+    let env_payload = crate::env::snapshot(&crate::env::tracked_keys());
+    if !env_payload.is_empty() {
+        let _ = writer
+            .send((Tag::EnvSet, Bytes::copy_from_slice(env_payload.as_bytes())))
+            .await;
+    }
 
     let mut out_buf: Vec<u8> = Vec::new();
     let mut stdin_buf = [0u8; 4096];

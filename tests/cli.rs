@@ -49,11 +49,18 @@ impl RiftTest {
     }
 
     fn spawn_pty(&self, args: &[&str]) -> (Child, File) {
+        self.spawn_pty_env(args, &[])
+    }
+
+    fn spawn_pty_env(&self, args: &[&str], env: &[(&str, &str)]) -> (Child, File) {
         let pty = openpty(None, None).expect("open test PTY");
         let master = File::from(pty.master);
         let slave = File::from(pty.slave);
-        let child = self
-            .command()
+        let mut command = self.command();
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let child = command
             .args(args)
             .stdin(Stdio::from(
                 slave.try_clone().expect("clone PTY slave for stdin"),
@@ -425,6 +432,117 @@ fn invalid_or_reserved_labels_are_rejected_without_mutation() {
     assert_eq!(reserved.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&reserved.stderr).contains("read-only built-in field"));
     assert!(test.output(&["get", "label-validation"]).stdout.is_empty());
+}
+
+#[test]
+fn attach_labels_flag_sets_labels_at_creation() {
+    let test = RiftTest::new();
+
+    // `new --labels` (detached create) applies labels atomically.
+    let create = test.output(&["new", "--labels", "project=rift env=prod", "prelabeled"]);
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    test.wait_for_session("prelabeled");
+    assert_eq!(
+        String::from_utf8_lossy(&test.output(&["get", "prelabeled"]).stdout),
+        "env=prod project=rift"
+    );
+
+    // The `--labels=<value>` form is also accepted.
+    let create_eq = test.output(&["new", "--labels=team=core", "prelabeled2"]);
+    assert!(create_eq.status.success());
+    test.wait_for_session("prelabeled2");
+    assert_eq!(
+        String::from_utf8_lossy(&test.output(&["get", "prelabeled2"]).stdout),
+        "team=core"
+    );
+
+    // An invalid pair is rejected before the session is created.
+    let invalid = test.output(&["new", "--labels", "bad key", "should-not-exist"]);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("key=value"));
+    let listed = String::from_utf8_lossy(&test.output(&["list", "--short"]).stdout).into_owned();
+    assert!(!listed.contains("should-not-exist"), "{listed}");
+
+    // A missing --labels value is a clear error (flag before name, no value).
+    let missing = test.output(&["new", "--labels"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--labels requires a value"));
+}
+
+#[test]
+fn print_env_reports_attached_clients_tracked_environment() {
+    use std::io::Read;
+
+    let test = RiftTest::new();
+
+    // Attach an interactive PTY client with a couple of tracked vars set and
+    // one deliberately unset. Use RIFT_TRACK_ENV to keep the set small and
+    // deterministic regardless of the ambient environment.
+    let (child, mut master) = test.spawn_pty_env(
+        &["attach", "envsess"],
+        &[
+            ("RIFT_TRACK_ENV", "DISPLAY,SSH_AUTH_SOCK,RIFT_ENV_ABSENT"),
+            ("DISPLAY", ":7"),
+            ("SSH_AUTH_SOCK", "/tmp/ssh-test"),
+            // RIFT_ENV_ABSENT intentionally left unset.
+        ],
+    );
+    test.wait_for_session("envsess");
+
+    // Drain PTY output on a background thread so the client never stalls on
+    // backpressure before it sends its env snapshot.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_reader = stop.clone();
+    let drain = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while !stop_reader.load(Ordering::Relaxed) {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        master
+    });
+    // Give the client a moment to send its EnvSet frame.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let all = test.output(&["print-env", "envsess"]);
+    let text = String::from_utf8_lossy(&all.stdout);
+    assert!(text.contains("DISPLAY=:7"), "{text}");
+    assert!(text.contains("SSH_AUTH_SOCK=/tmp/ssh-test"), "{text}");
+    assert!(text.contains("-RIFT_ENV_ABSENT"), "{text}");
+
+    // Single-key lookup of a set variable.
+    let one = test.output(&["print-env", "envsess", "DISPLAY"]);
+    assert_eq!(String::from_utf8_lossy(&one.stdout).trim(), ":7");
+
+    // Single-key lookup of an unset variable fails.
+    let missing = test.output(&["print-env", "envsess", "RIFT_ENV_ABSENT"]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("not found"));
+
+    // Shell mode emits export/unset statements.
+    let shell = test.output(&["print-env", "-s", "envsess"]);
+    let shell_text = String::from_utf8_lossy(&shell.stdout);
+    assert!(shell_text.contains("export DISPLAY=':7';"), "{shell_text}");
+    assert!(
+        shell_text.contains("unset RIFT_ENV_ABSENT;"),
+        "{shell_text}"
+    );
+
+    // Stop the client; killing it closes the PTY slave and unblocks the
+    // drain thread's blocking read with EOF.
+    stop.store(true, Ordering::Relaxed);
+    let _ = test.output(&["kill", "--force", "envsess"]);
+    let mut child = child;
+    let _ = child.kill();
+    let _ = child.wait();
+    let _master = drain.join().expect("join PTY drain");
 }
 
 #[test]

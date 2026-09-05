@@ -82,8 +82,9 @@ pub fn cmd_list(short: bool, verbose: bool, where_pair: Option<&str>) -> i32 {
 // labels
 // ---------------------------------------------------------------------------
 
-fn label_request(
+fn session_request(
     name: &str,
+    what: &str,
     request_tag: Tag,
     payload: &[u8],
     response_tag: Tag,
@@ -93,13 +94,22 @@ fn label_request(
     ipc::request_response(socket_path, request_tag, payload, response_tag).map_err(|error| {
         if matches!(error, ipc::ProbeError::Timeout) {
             format!(
-                "session '{}' did not respond to the label request; restart its daemon with this Rift version",
-                cfg.session_name
+                "session '{}' did not respond to the {} request; restart its daemon with this Rift version",
+                cfg.session_name, what
             )
         } else {
-            format!("label request for '{}': {}", cfg.session_name, error)
+            format!("{} request for '{}': {}", what, cfg.session_name, error)
         }
     })
+}
+
+fn label_request(
+    name: &str,
+    request_tag: Tag,
+    payload: &[u8],
+    response_tag: Tag,
+) -> Result<Vec<u8>, String> {
+    session_request(name, "label", request_tag, payload, response_tag)
 }
 
 pub fn cmd_label_get(name: &str, key: Option<&str>) -> i32 {
@@ -181,6 +191,40 @@ pub fn cmd_label_clear(name: &str) -> i32 {
             eprintln!("error: {error}");
             1
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// print-env
+// ---------------------------------------------------------------------------
+
+pub fn cmd_print_env(name: &str, key: Option<&str>, shell: bool) -> i32 {
+    let payload = match session_request(name, "print-env", Tag::EnvGet, &[], Tag::EnvData) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    let text = String::from_utf8_lossy(&payload);
+
+    if let Some(key) = key {
+        match crate::env::value_of(&text, key) {
+            Some(value) => {
+                println!("{value}");
+                0
+            }
+            None => {
+                eprintln!("error: environment variable not found: {key}");
+                1
+            }
+        }
+    } else if shell {
+        print!("{}", crate::env::to_shell(&text));
+        0
+    } else {
+        print!("{text}");
+        0
     }
 }
 
@@ -561,7 +605,7 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
             Ok(fd) => fd,
             Err(_) => {
                 socket::cleanup_stale_socket(&cfg.socket_dir, &cfg.session_name);
-                match daemon::spawn_daemon(&cfg, &[]) {
+                match daemon::spawn_daemon(&cfg, &[], &[]) {
                     Ok(fd) => fd,
                     Err(e) => {
                         eprintln!("error: {}", e);
@@ -570,7 +614,7 @@ pub fn cmd_run(name: &str, cmd_args: &[String], detached: bool, fish: bool) -> i
                 }
             }
         },
-        Ok(false) => match daemon::spawn_daemon(&cfg, &[]) {
+        Ok(false) => match daemon::spawn_daemon(&cfg, &[], &[]) {
             Ok(fd) => fd,
             Err(e) => {
                 eprintln!("error: {}", e);
@@ -963,15 +1007,32 @@ pub fn cmd_logs(name: &str, extra_args: &[String]) -> i32 {
 // attach
 // ---------------------------------------------------------------------------
 
-pub fn cmd_attach(name: &str, detached: bool, cmd: &[String]) -> i32 {
-    cmd_attach_with_policy(name, detached, cmd, true)
+pub fn cmd_attach(name: &str, detached: bool, cmd: &[String], labels: &[String]) -> i32 {
+    // Validate labels up front so an invalid pair fails before we create or
+    // switch anything. Each --labels value may hold several space-separated
+    // pairs (e.g. "project=pico env=prod"), matching `rift set`.
+    for group in labels {
+        for pair in group.split_whitespace() {
+            if let Err(error) = label::parse_pair(pair) {
+                eprintln!("error: {error}");
+                return 1;
+            }
+        }
+    }
+    cmd_attach_with_policy(name, detached, cmd, true, labels)
 }
 
 fn cmd_attach_new(name: &str, cmd: &[String]) -> i32 {
-    cmd_attach_with_policy(name, false, cmd, false)
+    cmd_attach_with_policy(name, false, cmd, false, &[])
 }
 
-fn cmd_attach_with_policy(name: &str, detached: bool, cmd: &[String], allow_existing: bool) -> i32 {
+fn cmd_attach_with_policy(
+    name: &str,
+    detached: bool,
+    cmd: &[String],
+    allow_existing: bool,
+    labels: &[String],
+) -> i32 {
     let current = socket::session_name_from_env();
     if !current.is_empty() {
         // We're running *inside* a rift session. Rather than refuse, ask the
@@ -979,7 +1040,7 @@ fn cmd_attach_with_policy(name: &str, detached: bool, cmd: &[String], allow_exis
         // requested session (tmux/zmx-style in-session switching). A detached
         // spawn (`--detached`) still just creates the session in the background.
         if detached {
-            return spawn_detached(name, cmd);
+            return spawn_detached(name, cmd, labels);
         }
         return request_switch(&current, name);
     }
@@ -1013,6 +1074,12 @@ fn cmd_attach_with_policy(name: &str, detached: bool, cmd: &[String], allow_exis
             }
             match socket::session_connect(&path_str) {
                 Ok(fd) => {
+                    // Session already exists: apply any requested labels to the
+                    // live daemon before attaching (create-time labels can't
+                    // apply retroactively, so honor them here instead).
+                    if !labels.is_empty() && apply_labels(name, labels) != 0 {
+                        return 1;
+                    }
                     return attach_and_follow_switches(cfg, name.to_string(), fd);
                 }
                 Err(_) => {
@@ -1028,7 +1095,7 @@ fn cmd_attach_with_policy(name: &str, detached: bool, cmd: &[String], allow_exis
     }
 
     if detached {
-        return match daemon::spawn_daemon_detached(&cfg, cmd) {
+        return match daemon::spawn_daemon_detached(&cfg, cmd, labels) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("error: {}", e);
@@ -1037,7 +1104,7 @@ fn cmd_attach_with_policy(name: &str, detached: bool, cmd: &[String], allow_exis
         };
     }
 
-    let socket_fd = match daemon::spawn_daemon(&cfg, cmd) {
+    let socket_fd = match daemon::spawn_daemon(&cfg, cmd, labels) {
         Ok(fd) => fd,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -1048,9 +1115,22 @@ fn cmd_attach_with_policy(name: &str, detached: bool, cmd: &[String], allow_exis
     attach_and_follow_switches(cfg, name.to_string(), socket_fd)
 }
 
+/// Apply `labels` (a slice of "k=v ..." groups) to a running session by name.
+/// Returns 0 on success, non-zero (after printing an error) otherwise.
+fn apply_labels(name: &str, labels: &[String]) -> i32 {
+    let payload = labels.join(" ");
+    match label_request(name, Tag::LabelSet, payload.as_bytes(), Tag::Ack) {
+        Ok(_) => 0,
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
+        }
+    }
+}
+
 /// Spawn `name` in the background without attaching (used for `--detached`
 /// even from inside a session).
-fn spawn_detached(name: &str, cmd: &[String]) -> i32 {
+fn spawn_detached(name: &str, cmd: &[String], labels: &[String]) -> i32 {
     let cfg = match Cfg::resolve(name) {
         Ok(c) => c,
         Err(e) => {
@@ -1067,7 +1147,7 @@ fn spawn_detached(name: &str, cmd: &[String]) -> i32 {
             eprintln!("error: session '{}' already exists", name);
             1
         }
-        Ok(false) => match daemon::spawn_daemon_detached(&cfg, cmd) {
+        Ok(false) => match daemon::spawn_daemon_detached(&cfg, cmd, labels) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("error: {}", e);
@@ -1166,7 +1246,7 @@ fn connect_or_spawn_for_switch(name: &str, cwd: Option<&str>) -> Result<(Cfg, Ow
     {
         let _ = std::env::set_current_dir(cwd);
     }
-    let fd = daemon::spawn_daemon(&cfg, &[])?;
+    let fd = daemon::spawn_daemon(&cfg, &[], &[])?;
     Ok((cfg, fd))
 }
 
@@ -1182,7 +1262,7 @@ pub fn cmd_smart(program: &str, args: &[String], force_new: bool) -> i32 {
 
     let executable = find_executable(program);
     if executable.is_none() && !force_new && !args.is_empty() && session_is_connectable(base_name) {
-        return cmd_attach(base_name, false, &[]);
+        return cmd_attach(base_name, false, &[], &[]);
     }
     if executable.is_none() && (force_new || !args.is_empty()) {
         eprintln!("error: command not found in PATH: {program}");
@@ -1197,7 +1277,7 @@ pub fn cmd_smart(program: &str, args: &[String], force_new: bool) -> i32 {
     });
 
     if !force_new {
-        return cmd_attach(base_name, false, &command);
+        return cmd_attach(base_name, false, &command, &[]);
     }
 
     let Some(name) = next_command_session_name(base_name) else {
@@ -1286,7 +1366,7 @@ pub fn cmd_pick() -> i32 {
         .strip_prefix(&prefix)
         .unwrap_or(&full_name)
         .to_string();
-    cmd_attach(&bare, false, &[])
+    cmd_attach(&bare, false, &[], &[])
 }
 
 fn run_external_picker(picker_cmd: &str, names: &[String]) -> Option<String> {
@@ -1379,7 +1459,7 @@ pub fn cmd_last() -> i32 {
     let prefix = socket::session_prefix();
     let full = format!("{}{}", prefix, name);
     match socket::session_exists(&socket_dir, &full) {
-        Ok(true) => cmd_attach(&name, false, &[]),
+        Ok(true) => cmd_attach(&name, false, &[], &[]),
         _ => {
             eprintln!("last session '{}' is gone", name);
             util::clear_last_session(&socket_dir);
